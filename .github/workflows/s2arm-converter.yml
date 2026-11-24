@@ -8,7 +8,7 @@ permissions:
   contents: read
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -346,7 +346,11 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/s2arm-port"
-          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          if [ -d /Applications/Xcode_26.6.app/Contents/Developer ]; then
+            sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          else
+            sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
+          fi
           xcodebuild -version
           dotnet workload install ios --version 10.0.401
           bash build.sh "$GITHUB_WORKSPACE/upstream"

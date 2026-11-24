@@ -250,6 +250,14 @@ jobs:
           PORT="$(cd "$(dirname "$0")" && pwd)"
           cd "$UPSTREAM"
           python3 runtime/rewriter/prepare_deps.py build/rewriter-deps
+          # CPack configures desktop installers; irrelevant to the embedded iOS library.
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("build/rewriter-deps/capstone-5.0.7/src/CMakeLists.txt")
+          s=p.read_text()
+          assert s.count("include(CPackConfig.txt)")==1
+          p.write_text(s.replace("include(CPackConfig.txt)","# CPack disabled for embedded iOS build"))
+          PY
           cmake -S runtime/rewriter -B build/ios-rewriter \
             -DS2A_REWRITER_DEPS="$UPSTREAM/build/rewriter-deps" \
             -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
@@ -257,10 +265,17 @@ jobs:
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DCMAKE_BUILD_TYPE=Release
           cmake --build build/ios-rewriter --config Release --target s2a_rewriter --parallel 3
           REWRITER=$(find build/ios-rewriter -name libs2a_rewriter.a -print -quit)
-          CAPSTONE=$(find build/ios-rewriter -name libcapstone.a -print -quit)
-          test -n "$REWRITER" && test -n "$CAPSTONE"
+          test -n "$REWRITER"
+          # Upstream links the Capstone OBJECT target into s2a_rewriter; avoid duplicate symbols.
+          LIBS=("$REWRITER")
+          if ! xcrun nm -gU "$REWRITER" > "$PORT/rewriter-symbols.txt" || ! grep -Eq "[[:space:]]T[[:space:]]_cs_open$" "$PORT/rewriter-symbols.txt"; then
+            cmake --build build/ios-rewriter --config Release --target capstone_static --parallel 3
+            CAPSTONE=$(find build/ios-rewriter -name libcapstone.a -print -quit)
+            test -n "$CAPSTONE"
+            LIBS+=("$CAPSTONE")
+          fi
           xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=18.0 -I runtime/rewriter -c "$PORT/bridge.c" -o "$PORT/bridge.o"
-          xcrun libtool -static -o "$PORT/libconverter.a" "$PORT/bridge.o" "$REWRITER" "$CAPSTONE"
+          xcrun libtool -static -o "$PORT/libconverter.a" "$PORT/bridge.o" "${LIBS[@]}"
           cp pack/nx_unpack/*.cs "$PORT/"
           python3 - "$PORT" <<'PY'
           import pathlib,re,sys,subprocess,json
@@ -281,7 +296,7 @@ jobs:
           find runtime/fix -maxdepth 1 -name '*.tsv' -exec cp {} "$PORT/fix/" \;
           cd "$PORT"
           dotnet build Converter.csproj -c Release -r ios-arm64 -p:EnableCodeSigning=false -p:BuildIpa=false
-          APP=$(find "$PORT/bin/Release/net10.0-ios/ios-arm64" -maxdepth 1 -type d -name '*.app' -print -quit)
+          APP=$(find "$PORT/bin/Release" -type d -name '*.app' -print -quit)
           test -n "$APP"
           mkdir -p "$PORT/dist/Payload"
           ditto "$APP" "$PORT/dist/Payload/S2ArmConverter.app"
@@ -353,6 +368,10 @@ jobs:
           fi
           xcodebuild -version
           dotnet workload install ios --version 10.0.401
+          # Match the installed .NET iOS SDK family to the selected Xcode.
+          if xcodebuild -version | grep -q "^Xcode 27"; then
+            sed -i '' 's|<TargetFramework>net10.0-ios</TargetFramework>|<TargetFramework>net10.0-ios27.0</TargetFramework>|' Converter.csproj
+          fi
           bash build.sh "$GITHUB_WORKSPACE/upstream"
       - uses: actions/upload-artifact@v4
         with:

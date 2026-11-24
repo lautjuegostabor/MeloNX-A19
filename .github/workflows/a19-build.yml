@@ -1153,6 +1153,1290 @@ jobs:
           A19_LAB_PATCH
           git apply --check "$RUNNER_TEMP/a19-lab.patch"
           git apply "$RUNNER_TEMP/a19-lab.patch"
+          cat > "$RUNNER_TEMP/a19-v05.patch" <<'A19_V05_PATCH'
+          diff --git a/src/MeloNX/MeloNX/Common/A19Bench.c b/src/MeloNX/MeloNX/Common/A19Bench.c
+          index 5487ef0..95f89b3 100644
+          --- a/src/MeloNX/MeloNX/Common/A19Bench.c
+          +++ b/src/MeloNX/MeloNX/Common/A19Bench.c
+          @@ -75,3 +75,75 @@ uint64_t a19_available_memory(void) {
+               return 0;
+           #endif
+           }
+          +
+          +// Independent crash-resilient trace. All counters are cumulative except the documented gauges.
+          +#include <stdio.h>
+          +#include <pthread.h>
+          +#include <unistd.h>
+          +#include <inttypes.h>
+          +#ifdef __APPLE__
+          +#include <mach/mach.h>
+          +#endif
+          +extern int32_t a19_probe_read(int64_t *, int32_t);
+          +extern int64_t a19_probe_frequency(void);
+          +static pthread_t trace_thread;
+          +static int trace_joinable; // start/stop called only from Swift main actor
+          +static _Atomic int trace_running, trace_count, trace_error;
+          +static FILE *trace_file;
+          +static uint64_t trace_footprint(void) {
+          +#ifdef __APPLE__
+          +    task_vm_info_data_t info;
+          +    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+          +    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
+          +        return info.phys_footprint;
+          +#endif
+          +    return 0;
+          +}
+          +static int trace_flush(FILE *f) { return fflush(f) == 0 && fsync(fileno(f)) == 0; }
+          +static void *trace_worker(void *unused) {
+          +    (void)unused;
+          +    FILE *f = trace_file;
+          +    const double start = ns();
+          +    double previous = start, previousWrite = 0;
+          +    int sequence = 0;
+          +    while (atomic_load(&trace_running) && sequence <= 600) {
+          +        int64_t values[61];
+          +        double now = ns();
+          +        if (a19_probe_read(values, 61) != 61) { atomic_store(&trace_error, 2); break; }
+          +        int64_t cpu = a19_cpu_time_us();
+          +        uint64_t footprint = trace_footprint(), available = a19_available_memory();
+          +        fprintf(f, "{\"type\":\"sample\",\"seq\":%d,\"elapsedSeconds\":%.6f,\"intervalSeconds\":%.6f,\"processCPUTimeUs\":%" PRId64 ",\"footprintBytes\":%" PRIu64 ",\"availableProcessBytes\":%" PRIu64 ",\"previousWriteMs\":%.3f,\"counters\":[", sequence, (now-start)/1e9, (now-previous)/1e9, cpu, footprint, available, previousWrite);
+          +        for (int i = 0; i < 61; i++) fprintf(f, "%s%" PRId64, i ? "," : "", values[i]);
+          +        fputs("]}\n", f);
+          +        if (ferror(f) || !trace_flush(f)) { atomic_store(&trace_error, 3); break; }
+          +        previousWrite = (ns()-now)/1e6;
+          +        previous = now;
+          +        atomic_store(&trace_count, ++sequence);
+          +        // Poll stop every 100ms; normal sample cadence approximately one second.
+          +        for (int i=0; i<10 && atomic_load(&trace_running); i++) {
+          +            struct timespec delay = {0, 100000000}; nanosleep(&delay, NULL);
+          +        }
+          +    }
+          +    fclose(f);
+          +    atomic_store(&trace_running, 0);
+          +    return NULL;
+          +}
+          +void a19_trace_stop(void) {
+          +    atomic_store(&trace_running, 0);
+          +    if (trace_joinable) { pthread_join(trace_thread, NULL); trace_joinable = 0; }
+          +}
+          +int32_t a19_trace_start(const char *path) {
+          +    a19_trace_stop();
+          +    atomic_store(&trace_count, 0); atomic_store(&trace_error, 0);
+          +    trace_file = fopen(path, "w");
+          +    if (!trace_file) return 0;
+          +    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":2,\"build\":\"A19 Lab 0.5\",\"stopwatchFrequency\":%" PRId64 ",\"counterMode\":\"cumulative except gauges 29-35 and 44-60\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\"]}\n", a19_probe_frequency());
+          +    if (!trace_flush(trace_file)) { fclose(trace_file); return 0; }
+          +    atomic_store(&trace_running, 1);
+          +    if (pthread_create(&trace_thread, NULL, trace_worker, NULL) != 0) {
+          +        atomic_store(&trace_running, 0); fclose(trace_file); return 0;
+          +    }
+          +    trace_joinable = 1; return 1;
+          +}
+          +int32_t a19_trace_count(void) { return atomic_load(&trace_count); }
+          +int32_t a19_trace_error(void) { return atomic_load(&trace_error); }
+          diff --git a/src/MeloNX/MeloNX/Common/A19Lab.swift b/src/MeloNX/MeloNX/Common/A19Lab.swift
+          index d4e7b05..f1d988c 100644
+          --- a/src/MeloNX/MeloNX/Common/A19Lab.swift
+          +++ b/src/MeloNX/MeloNX/Common/A19Lab.swift
+          @@ -12,14 +12,19 @@ import Darwin
+           @_silgen_name("a19_cpu_benchmark") private nonisolated func a19CpuBench(_ output: UnsafeMutablePointer<Double>, _ count: Int32) -> Int32
+           @_silgen_name("a19_cpu_time_us") private func a19CpuTime() -> Int64
+           @_silgen_name("a19_available_memory") private func a19AvailableMemory() -> UInt64
+          +@_silgen_name("a19_trace_start") private func a19TraceStart(_ path: UnsafePointer<CChar>) -> Int32
+          +@_silgen_name("a19_trace_stop") private func a19TraceStop()
+          +@_silgen_name("a19_trace_count") private func a19TraceCount() -> Int32
+          +@_silgen_name("a19_trace_error") private func a19TraceError() -> Int32
+           
+           private let a19Names: [String] = [
+               "frames", "frame_interval_us", "frame_le_8_334ms", "frame_8_334_to_16_667ms", "frame_16_667_to_33_334ms", "frame_33_334_to_50ms", "frame_50_to_100ms", "frame_gt_100ms",
+               "jit_compiles", "jit_compile_ticks", "jit_host_code_bytes", "jit_guest_code_bytes", "jit_shared_copy_bytes", "jit_local_copy_bytes", "jit_local_page_bytes", "jit_pad_calls", "jit_pad_ticks", "jit_local_icache_calls", "jit_local_icache_ticks",
+               "fence_wait_calls", "fence_wait_ticks", "queue_submit_calls", "queue_submit_ticks", "pipeline_create_calls", "pipeline_create_ticks", "mapped_upload_bytes", "mirror_upload_bytes", "background_compile_jobs", "background_compile_ticks",
+          -    "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes"
+          +    "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes",
+          +    "mvk_statistics_result", "mvk_spirv_to_msl_count", "mvk_spirv_to_msl_avg_us", "mvk_msl_compile_count", "mvk_msl_compile_avg_us", "mvk_shader_cache_count", "mvk_shader_cache_avg_us", "mvk_pipeline_compile_count", "mvk_pipeline_compile_avg_us", "mvk_retrieve_command_count", "mvk_retrieve_command_avg_us", "mvk_encode_command_count", "mvk_encode_command_avg_us", "mvk_execute_command_count", "mvk_execute_command_avg_us", "mvk_gpu_memory_count", "mvk_gpu_memory_avg_kib_x1000"
+           ]
+          -private let a19Gauges = Set(29...35)
+          +private let a19Gauges = Set(29...35).union(44...60)
+           
+           private struct A19Sample: Codable {
+               let elapsedSeconds: Double
+          @@ -106,6 +111,7 @@ private nonisolated enum A19Hardware {
+               @Published private(set) var benchmarking = false
+               @Published private(set) var sampleCount = 0
+               @Published private(set) var reportURL: URL?
+          +    @Published private(set) var traceURL: URL?
+               @Published private(set) var status = "Ready"
+               @Published var argumentBuffers = 0
+               @Published var commandLimit = 0
+          @@ -121,7 +127,7 @@ private nonisolated enum A19Hardware {
+               private var gameStartSeconds: Double?
+               private var gameEndSeconds: Double?
+               private var gameExitCode: Int?
+          -    private var previous = [Int64](repeating: 0, count: 44)
+          +    private var previous = [Int64](repeating: 0, count: 61)
+               private var started = 0.0
+               private var lastTime = 0.0
+               private var lastCpu: Int64 = -1
+          @@ -129,8 +135,12 @@ private nonisolated enum A19Hardware {
+               private var destination: URL {
+                   FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(reportName)
+               }
+          +    private var traceDestination: URL {
+          +        destination.deletingLastPathComponent().appendingPathComponent("MeloNX-A19-trace.jsonl")
+          +    }
+               init() {
+                   if FileManager.default.fileExists(atPath: destination.path) { reportURL = destination }
+          +        if FileManager.default.fileExists(atPath: traceDestination.path) { traceURL = traceDestination }
+               }
+               func apply() {
+                   guard !running && !benchmarking else { return }
+          @@ -149,7 +159,7 @@ private nonisolated enum A19Hardware {
+                       result["metalMaxBufferLength"] = String(device.maxBufferLength)
+                       result["metalCounterSets"] = device.counterSets?.map(\.name).joined(separator: ",") ?? "unavailable"
+                   }
+          -        for key in ["hw.cachelinesize", "hw.l1icachesize", "hw.l1dcachesize", "hw.l2cachesize", "hw.l3cachesize", "hw.optional.arm.FEAT_LSE", "hw.optional.arm.FEAT_LRCPC", "hw.optional.arm.FEAT_FP16", "hw.optional.arm.FEAT_DotProd", "hw.optional.arm.FEAT_MOPS"] {
+          +        for key in ["hw.nperflevels", "hw.perflevel0.physicalcpu", "hw.perflevel1.physicalcpu", "hw.perflevel0.l1dcachesize", "hw.perflevel1.l1dcachesize", "hw.perflevel0.l1icachesize", "hw.perflevel1.l1icachesize", "hw.perflevel0.l2cachesize", "hw.perflevel1.l2cachesize", "hw.cachelinesize", "hw.l1icachesize", "hw.l1dcachesize", "hw.l2cachesize", "hw.l3cachesize", "hw.optional.arm.FEAT_LSE", "hw.optional.arm.FEAT_LRCPC", "hw.optional.arm.FEAT_FP16", "hw.optional.arm.FEAT_DotProd", "hw.optional.arm.FEAT_MOPS"] {
+                       var value: UInt64 = 0; var size = MemoryLayout<UInt64>.size
+                       let code = key.withCString { sysctlbyname($0, &value, &size, nil, 0) }
+                       if code == 0 { result[key] = String(value) }
+          @@ -174,7 +184,7 @@ private nonisolated enum A19Hardware {
+                   }
+               }
+               private func read() -> [Int64]? {
+          -        var result = [Int64](repeating: 0, count: 44)
+          +        var result = [Int64](repeating: 0, count: 61)
+                   let count = result.withUnsafeMutableBufferPointer { a19Read($0.baseAddress!, Int32($0.count)) }
+                   return count == Int32(result.count) ? result : nil
+               }
+          @@ -205,14 +215,19 @@ private nonisolated enum A19Hardware {
+                   gameSettings = [:]; gameStartSeconds = nil; gameEndSeconds = nil; gameExitCode = nil
+                   selected = ["argumentBuffers":argumentBuffers,"commandLimit":commandLimit,"shaderWorkers":shaderWorkers,"jitPadCalls":jitPadCalls]
+                   started = ProcessInfo.processInfo.systemUptime; lastTime = started; lastCpu = a19CpuTime()
+          -        running = true; a19Enable(1); status = "Capture active. Start a controlled test."
+          +        a19Enable(1)
+          +        guard traceDestination.path.withCString({ a19TraceStart($0) }) == 1 else {
+          +            a19Enable(0); status = "Native trace could not start."; return
+          +        }
+          +        traceURL = traceDestination
+          +        running = true; status = "Native capture active. Start a controlled test."
+                   writeReport()
+                   task = Task { [weak self] in
+                       while !Task.isCancelled {
+                           try? await Task.sleep(nanoseconds: 1_000_000_000)
+                           guard !Task.isCancelled, let self, self.running else { break }
+          -                self.sample()
+          -                if self.samples.count >= 600 { self.stop(); break }
+          +                self.sampleCount = Int(a19TraceCount())
+          +                if a19TraceError() != 0 || self.sampleCount >= 601 { self.stop(); break }
+                       }
+                   }
+               }
+          @@ -227,11 +242,13 @@ private nonisolated enum A19Hardware {
+               }
+               func stop() {
+                   guard running else { return }
+          -        if samples.count < 600 { sample() }; running = false; a19Enable(0); task?.cancel(); task = nil
+          -        status = "Capture stopped: \(sampleCount) samples."; writeReport()
+          +        a19TraceStop(); sampleCount = Int(a19TraceCount())
+          +        running = false; a19Enable(0); task?.cancel(); task = nil
+          +        status = a19TraceError() == 0 ? "Capture stopped: \(sampleCount) samples." : "Capture stopped with write/read error: \(a19TraceError())."
+          +        writeReport()
+               }
+               private func writeReport() {
+          -        let report = A19Report(schemaVersion: 1, build: "A19 Lab 0.4", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Counters are interval deltas except MVK and shader worker gauges. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
+          +        let report = A19Report(schemaVersion: 2, build: "A19 Lab 0.5", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Native JSONL counters are cumulative except gauges at indices 29–35 and 44–60; export both files. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
+                   do { let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]; try encoder.encode(report).write(to: destination, options: .atomic); reportURL = destination }
+                   catch { status = "Report could not be saved." }
+               }
+          @@ -255,13 +272,16 @@ struct A19LabView: View {
+                       Section("Core trace") {
+                           if lab.running { Button("Stop and save trace") { lab.stop() } }
+                           else { Button("Start trace") { lab.start() }.disabled(lab.benchmarking) }
+          -                Text("Samples: \(lab.sampleCount) / 600. Saves every 10 samples to the app’s Files folder.").font(.caption)
+          +                Text("Samples: \(lab.sampleCount) / 601. Native JSONL saved from the first sample, even if the interface stalls.").font(.caption)
+                       }
+                       Section("Export") {
+                           if let url = lab.reportURL {
+                               if #available(iOS 16.0, *) { ShareLink(item: url) { Label("Share research JSON", systemImage: "square.and.arrow.up") } }
+                               else { Text("Report saved in Files: \(url.lastPathComponent)") }
+                           }
+          +                if let trace = lab.traceURL {
+          +                    if #available(iOS 16.0, *) { ShareLink(item: trace) { Label("Share native trace JSONL", systemImage: "square.and.arrow.up") } }
+          +                }
+                           Text(lab.status).font(.caption)
+                       }
+                   }.navigationTitle("A19 Performance Lab")
+          diff --git a/src/Ryujinx.Common/A19Probe.cs b/src/Ryujinx.Common/A19Probe.cs
+          index 7176172..1446206 100644
+          --- a/src/Ryujinx.Common/A19Probe.cs
+          +++ b/src/Ryujinx.Common/A19Probe.cs
+          @@ -7,8 +7,10 @@ namespace Ryujinx.Common
+               // Cumulative counters; snapshots are deliberately non-blocking and approximate across threads.
+               public static class A19Probe
+               {
+          -        public const int Count = 44;
+          -        private static readonly long[] Values = new long[Count];
+          +        public const int Count = 61;
+          +        // A19 reports 128-byte cache lines. 256-byte stride also prevents adjacent counters sharing a line.
+          +        private const int Stride = 32;
+          +        private static readonly long[] Values = new long[Count * Stride];
+                   private static int _enabled, _argumentBuffers, _commandLimit, _shaderWorkers, _jitPadCalls;
+                   public static bool Enabled => Volatile.Read(ref _enabled) != 0;
+                   public static int ArgumentBuffers => Volatile.Read(ref _argumentBuffers);
+          @@ -26,24 +28,24 @@ namespace Ryujinx.Common
+                   public static long Start() => Enabled ? Stopwatch.GetTimestamp() : 0;
+                   public static void Add(int index, long amount = 1)
+                   {
+          -            if (Enabled) Interlocked.Add(ref Values[index], amount);
+          +            if (Enabled) Interlocked.Add(ref Values[index * Stride], amount);
+                   }
+          -        public static void Set(int index, long value) => Interlocked.Exchange(ref Values[index], value);
+          +        public static void Set(int index, long value) => Interlocked.Exchange(ref Values[index * Stride], value);
+                   public static void End(long start, int count, int ticks)
+                   {
+                       if (start == 0 || !Enabled) return;
+          -            Interlocked.Increment(ref Values[count]);
+          -            Interlocked.Add(ref Values[ticks], Stopwatch.GetTimestamp() - start);
+          +            Interlocked.Increment(ref Values[count * Stride]);
+          +            Interlocked.Add(ref Values[ticks * Stride], Stopwatch.GetTimestamp() - start);
+                   }
+                   public static void Frame(double seconds)
+                   {
+          -            if (!Enabled || seconds <= 0 || seconds > 10) return;
+          +            if (!Enabled || !double.IsFinite(seconds) || seconds <= 0 || seconds > 86400) return;
+                       long us = (long)(seconds * 1_000_000);
+          -            Interlocked.Increment(ref Values[0]);
+          -            Interlocked.Add(ref Values[1], us);
+          +            Interlocked.Increment(ref Values[0 * Stride]);
+          +            Interlocked.Add(ref Values[1 * Stride], us);
+                       int bucket = us <= 8334 ? 2 : us <= 16667 ? 3 : us <= 33334 ? 4 : us <= 50000 ? 5 : us <= 100000 ? 6 : 7;
+          -            Interlocked.Increment(ref Values[bucket]);
+          +            Interlocked.Increment(ref Values[bucket * Stride]);
+                   }
+          -        public static long Read(int index) => Interlocked.Read(ref Values[index]);
+          +        public static long Read(int index) => Interlocked.Read(ref Values[index * Stride]);
+               }
+           }
+          diff --git a/src/Ryujinx.Cpu/LightningJit/Cache/DualMappedNoWxCache.cs b/src/Ryujinx.Cpu/LightningJit/Cache/DualMappedNoWxCache.cs
+          index c3a7337..e886dbd 100644
+          --- a/src/Ryujinx.Cpu/LightningJit/Cache/DualMappedNoWxCache.cs
+          +++ b/src/Ryujinx.Cpu/LightningJit/Cache/DualMappedNoWxCache.cs
+          @@ -345,12 +345,15 @@ namespace Ryujinx.Cpu.LightningJit.Cache
+           
+                       int pageSize = (int)MemoryBlock.GetPageSize();
+           
+          -            foreach ((_, ThreadLocalCacheEntry entry) in threadLocalCache)
+          +            lock (_lock)
+                       {
+          -                int sizeAligned = BitUtils.AlignUp(entry.Size, pageSize);
+          +                foreach ((_, ThreadLocalCacheEntry entry) in threadLocalCache)
+          +                {
+          +                    int sizeAligned = BitUtils.AlignUp(entry.Size, pageSize);
+           
+          -                _localCache.Free(entry.Offset, sizeAligned);
+          -                // _localCache.ReprotectAsRw(entry.Offset, sizeAligned);
+          +                    _localCache.Free(entry.Offset, sizeAligned);
+          +                    // _localCache.ReprotectAsRw(entry.Offset, sizeAligned);
+          +                }
+                       }
+           
+                       threadLocalCache.Clear();
+          diff --git a/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs b/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs
+          index 06575e2..26a9bc8 100644
+          --- a/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs
+          +++ b/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs
+          @@ -70,6 +70,12 @@ namespace Ryujinx.Graphics.Vulkan
+           
+                       try
+                       {
+          +                // Another allocator may have inserted this type after our read lock was released.
+          +                foreach (MemoryAllocatorBlockList existing in _blockLists)
+          +                {
+          +                    if (existing.MemoryTypeIndex == memoryTypeIndex && existing.ForBuffer == isBuffer)
+          +                        return existing.Allocate(size, alignment, map);
+          +                }
+                           MemoryAllocatorBlockList newBl = new(_api, _device, memoryTypeIndex, _blockAlignment, isBuffer);
+                           _blockLists.Add(newBl);
+           
+          diff --git a/src/Ryujinx.Graphics.Vulkan/MemoryAllocatorBlockList.cs b/src/Ryujinx.Graphics.Vulkan/MemoryAllocatorBlockList.cs
+          index acd7915..79899f5 100644
+          --- a/src/Ryujinx.Graphics.Vulkan/MemoryAllocatorBlockList.cs
+          +++ b/src/Ryujinx.Graphics.Vulkan/MemoryAllocatorBlockList.cs
+          @@ -188,7 +188,7 @@ namespace Ryujinx.Graphics.Vulkan
+                           throw new ArgumentOutOfRangeException(nameof(alignment), $"Invalid alignment 0x{alignment:X}.");
+                       }
+           
+          -            _lock.EnterReadLock();
+          +            _lock.EnterWriteLock();
+           
+                       try
+                       {
+          @@ -208,7 +208,7 @@ namespace Ryujinx.Graphics.Vulkan
+                       }
+                       finally
+                       {
+          -                _lock.ExitReadLock();
+          +                _lock.ExitWriteLock();
+                       }
+           
+                       ulong blockAlignedSize = BitUtils.AlignUp(size, (ulong)_blockAlignment);
+          @@ -227,16 +227,20 @@ namespace Ryujinx.Graphics.Vulkan
+                       if (map)
+                       {
+                           void* pointer = null;
+          -                _api.MapMemory(_device, deviceMemory, 0, blockAlignedSize, 0, ref pointer).ThrowOnError();
+          +                Result mapResult = _api.MapMemory(_device, deviceMemory, 0, blockAlignedSize, 0, ref pointer);
+          +                if (mapResult != Result.Success)
+          +                {
+          +                    _api.FreeMemory(_device, deviceMemory, null);
+          +                    mapResult.ThrowOnError();
+          +                }
+                           hostPointer = (nint)pointer;
+                       }
+           
+                       Block newBlock = new(deviceMemory, hostPointer, blockAlignedSize);
+           
+          -            InsertBlock(newBlock);
+          -
+                       ulong newBlockOffset = newBlock.Allocate(size, alignment);
+                       Debug.Assert(newBlockOffset != InvalidOffset);
+          +            InsertBlock(newBlock);
+           
+                       return new MemoryAllocation(this, newBlock, deviceMemory, GetHostPointer(newBlock, newBlockOffset), newBlockOffset, size);
+                   }
+          @@ -253,30 +257,22 @@ namespace Ryujinx.Graphics.Vulkan
+           
+                   public void Free(Block block, ulong offset, ulong size)
+                   {
+          -            block.Free(offset, size);
+          -
+          -            if (block.IsTotallyFree())
+          +            bool destroy = false;
+          +            _lock.EnterWriteLock();
+          +            try
+                       {
+          -                _lock.EnterWriteLock();
+          -
+          -                try
+          +                block.Free(offset, size);
+          +                if (block.IsTotallyFree())
+                           {
+          -                    for (int i = 0; i < _blocks.Count; i++)
+          -                    {
+          -                        if (_blocks[i] == block)
+          -                        {
+          -                            _blocks.RemoveAt(i);
+          -                            break;
+          -                        }
+          -                    }
+          -                }
+          -                finally
+          -                {
+          -                    _lock.ExitWriteLock();
+          +                    destroy = _blocks.Remove(block);
+                           }
+          -
+          -                block.Destroy(_api, _device);
+                       }
+          +            finally
+          +            {
+          +                _lock.ExitWriteLock();
+          +            }
+          +            // The block is unreachable by Allocate before freeing the Vulkan resource.
+          +            if (destroy) block.Destroy(_api, _device);
+                   }
+           
+                   private void InsertBlock(Block block)
+          diff --git a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKConfiguration.cs b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKConfiguration.cs
+          index 2719993..579a9b7 100644
+          --- a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKConfiguration.cs
+          +++ b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKConfiguration.cs
+          @@ -69,7 +69,7 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+                   public Bool32 DebugMode;
+                   public Bool32 ShaderConversionFlipVertexY;
+                   public Bool32 SynchronousQueueSubmits;
+          -        public Bool32 PrefillMetalCommandBuffers;
+          +        public uint PrefillMetalCommandBuffers;
+                   public uint MaxActiveMetalCommandBuffersPerQueue;
+                   public Bool32 SupportLargeQueryPools;
+                   public Bool32 PresentWithCommandBuffer;
+          @@ -83,7 +83,7 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+                   public Bool32 FullImageViewSwizzle;
+                   public uint DefaultGPUCaptureScopeQueueFamilyIndex;
+                   public uint DefaultGPUCaptureScopeQueueIndex;
+          -        public Bool32 FastMathEnabled;
+          +        public uint FastMathEnabled;
+                   public MVKConfigLogLevel LogLevel;
+                   public MVKConfigTraceVulkanCalls TraceVulkanCalls;
+                   public Bool32 ForceLowPowerGPU;
+          @@ -94,11 +94,11 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+                   public Bool32 Texture1DAs2D;
+                   public Bool32 PreallocateDescriptors;
+                   public Bool32 UseCommandPooling;
+          -        public Bool32 UseMTLHeap;
+          -        public Bool32 LogActivityPerformanceInline;
+          +        public uint UseMTLHeap;
+          +        public uint LogActivityPerformanceInline;
+                   public uint ApiVersionToAdvertise;
+                   public MVKConfigAdvertiseExtensions AdvertiseExtensions;
+                   public Bool32 ResumeLostDevice;
+          -        public Bool32 UseMetalArgumentBuffers;
+          +        public uint UseMetalArgumentBuffers;
+               }
+           }
+          diff --git a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
+          index af95d1c..bf7c08b 100644
+          --- a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
+          +++ b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
+          @@ -21,23 +21,35 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+           
+                   public static void Initialize()
+                   {
+          +            A19Probe.Set(44, -104); // no native statistics sampled for this device yet
+          +            for (int i = 45; i < A19Probe.Count; i++) A19Probe.Set(i, 0);
+                       nint configSize = (nint)Marshal.SizeOf<MVKConfiguration>();
+           
+                       Result getResult = vkGetMoltenVKConfigurationMVK(nint.Zero, out MVKConfiguration config, ref configSize);
+                       A19Probe.Set(29, (int)getResult);
+           
+          -            config.UseMetalArgumentBuffers = true;
+          -            config.FastMathEnabled = true;
+          +            int knownSize = Marshal.SizeOf<MVKConfiguration>();
+          +            // MoltenVK returns Incomplete when the caller supplies an older prefix.
+          +            // Never send a zero/default struct if the read failed or the prefix is too short.
+          +            if (!Readable(getResult, configSize, knownSize)) return;
+          +            config.UseMetalArgumentBuffers = 1;
+          +            config.FastMathEnabled = 1;
+           
+                       config.SemaphoreSupportStyle = MVKVkSemaphoreSupportStyle.MVK_CONFIG_VK_SEMAPHORE_SUPPORT_STYLE_SINGLE_QUEUE;
+                       // config.SynchronousQueueSubmits = false;
+           
+                       config.ResumeLostDevice = true;
+           
+          -            if (OperatingSystem.IsIOS() && getResult == Result.Success)
+          +            if (OperatingSystem.IsIOS())
+                       {
+          -                if (A19Probe.ArgumentBuffers != 0) config.UseMetalArgumentBuffers = A19Probe.ArgumentBuffers == 1;
+          +                if (A19Probe.ArgumentBuffers != 0) config.UseMetalArgumentBuffers = A19Probe.ArgumentBuffers == 1 ? 1u : 0u;
+                           if (A19Probe.CommandLimit != 0) config.MaxActiveMetalCommandBuffersPerQueue = (uint)A19Probe.CommandLimit;
+          +                if (A19Probe.Enabled)
+          +                {
+          +                    config.PerformanceTracking = true;
+          +                    config.PerformanceLoggingFrameCount = 0;
+          +                    config.LogActivityPerformanceInline = 0;
+          +                }
+                       }
+                       configSize = (nint)Marshal.SizeOf<MVKConfiguration>();
+                       Result setResult = vkSetMoltenVKConfigurationMVK(nint.Zero, config, ref configSize);
+          @@ -45,11 +57,69 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+                       configSize = (nint)Marshal.SizeOf<MVKConfiguration>();
+                       Result readResult = vkGetMoltenVKConfigurationMVK(nint.Zero, out MVKConfiguration actual, ref configSize);
+                       A19Probe.Set(31, (int)readResult);
+          -            A19Probe.Set(32, readResult == Result.Success ? (actual.UseMetalArgumentBuffers ? 1 : 0) : -1);
+          -            A19Probe.Set(33, readResult == Result.Success ? actual.MaxActiveMetalCommandBuffersPerQueue : -1L);
+          +            A19Probe.Set(32, Readable(readResult, configSize, knownSize) ? (long)actual.UseMetalArgumentBuffers : -1L);
+          +            A19Probe.Set(33, Readable(readResult, configSize, knownSize) ? actual.MaxActiveMetalCommandBuffersPerQueue : -1L);
+                       A19Probe.Set(34, configSize.ToInt64());
+                   }
+           
+          +        // v1.4.0 has 24 consecutive trackers, each 48 bytes on arm64.
+          +        // Reject different private API layouts rather than interpreting an incompatible buffer.
+          +        [StructLayout(LayoutKind.Sequential)]
+          +        private struct Tracker
+          +        {
+          +            public uint Count;
+          +            public double Latest, Previous, Average, Minimum, Maximum;
+          +        }
+          +
+          +        [LibraryImport("libMoltenVK.dylib")]
+          +        private static unsafe partial Result vkGetPerformanceStatisticsMVK(nint device, Tracker* statistics, ref nint size);
+          +
+          +        private static bool _statsUnavailable;
+          +
+          +        public static unsafe void SamplePerformance(Device device)
+          +        {
+          +            if (!OperatingSystem.IsIOS() || !A19Probe.Enabled || _statsUnavailable) return;
+          +            const int trackerCount = 24;
+          +            nint expected = trackerCount * sizeof(Tracker);
+          +            if (sizeof(Tracker) != 48) { A19Probe.Set(44, -100); _statsUnavailable = true; return; }
+          +            try
+          +            {
+          +                nint size = 0;
+          +                Result query = vkGetPerformanceStatisticsMVK(device.Handle, null, ref size);
+          +                if (size != expected || (query != Result.Success && query != Result.Incomplete))
+          +                {
+          +                    A19Probe.Set(44, -101); _statsUnavailable = true; return;
+          +                }
+          +                Tracker* stats = stackalloc Tracker[trackerCount];
+          +                Result result = vkGetPerformanceStatisticsMVK(device.Handle, stats, ref size);
+          +                A19Probe.Set(44, (int)result);
+          +                if (result != Result.Success || size != expected) return;
+          +                // Counts and averages are device-lifetime gauges, not interval deltas.
+          +                ReadTracker(stats[1], 45);  // SPIR-V to MSL
+          +                ReadTracker(stats[2], 47);  // MSL compilation
+          +                ReadTracker(stats[6], 49);  // shader library cache
+          +                ReadTracker(stats[9], 51);  // pipeline compilation
+          +                ReadTracker(stats[14], 53); // retrieve command buffer
+          +                ReadTracker(stats[15], 55); // command buffer encoding
+          +                ReadTracker(stats[18], 57); // commit to completion
+          +                ReadTracker(stats[23], 59); // GPU allocated memory (KiB)
+          +            }
+          +            catch (EntryPointNotFoundException) { A19Probe.Set(44, -102); _statsUnavailable = true; }
+          +            catch (DllNotFoundException) { A19Probe.Set(44, -103); _statsUnavailable = true; }
+          +        }
+          +
+          +        private static void ReadTracker(Tracker tracker, int index)
+          +        {
+          +            A19Probe.Set(index, tracker.Count);
+          +            double scaled = tracker.Average * 1000.0;
+          +            A19Probe.Set(index + 1, double.IsFinite(scaled) && scaled >= 0 && scaled < long.MaxValue ? (long)scaled : -1);
+          +        }
+          +
+          +        private static bool Readable(Result result, nint size, int expected)
+          +        {
+          +            return (result == Result.Success || result == Result.Incomplete) && size.ToInt64() >= expected;
+          +        }
+          +
+                   private static string[] Resolver(string path)
+                   {
+                       if (path.EndsWith(VulkanLib))
+          diff --git a/src/Ryujinx.Graphics.Vulkan/VulkanRenderer.cs b/src/Ryujinx.Graphics.Vulkan/VulkanRenderer.cs
+          index 5016410..2a0cbc9 100644
+          --- a/src/Ryujinx.Graphics.Vulkan/VulkanRenderer.cs
+          +++ b/src/Ryujinx.Graphics.Vulkan/VulkanRenderer.cs
+          @@ -1,4 +1,5 @@
+           using Gommon;
+          +using Ryujinx.Common;
+           using Ryujinx.Common.Configuration;
+           using Ryujinx.Common.Helper;
+           using Ryujinx.Common.Logging;
+          @@ -987,9 +988,20 @@ namespace Ryujinx.Graphics.Vulkan
+                       return false;
+                   }
+           
+          +        private long _lastA19Statistics;
+          +
+                   public void PreFrame()
+                   {
+                       SyncManager.Cleanup();
+          +            if (OperatingSystem.IsIOS() && A19Probe.Enabled)
+          +            {
+          +                long now = System.Diagnostics.Stopwatch.GetTimestamp();
+          +                if (now - _lastA19Statistics >= System.Diagnostics.Stopwatch.Frequency)
+          +                {
+          +                    _lastA19Statistics = now;
+          +                    MVKInitialization.SamplePerformance(_device);
+          +                }
+          +            }
+                   }
+           
+                   public ICounterEvent ReportCounter(CounterType type, EventHandler<ulong> resultHandler, float divisor, bool hostReserved)
+          diff --git a/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/IClient.cs b/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/IClient.cs
+          index cb56be3..b941575 100644
+          --- a/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/IClient.cs
+          +++ b/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/IClient.cs
+          @@ -9,6 +9,7 @@ using System.Net;
+           using System.Net.Sockets;
+           using System.Runtime.CompilerServices;
+           using System.Text;
+          +using System.Threading;
+           
+           namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd
+           {
+          @@ -22,6 +23,7 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd
+                       ManagedSocketPollManager.Instance
+                   ];
+           
+          +        private static long _badDescriptorCount;
+                   private BsdContext _context;
+                   private readonly bool _isPrivileged;
+           
+          @@ -36,7 +38,16 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd
+                       {
+                           if (errorCode != LinuxError.EWOULDBLOCK)
+                           {
+          -                    Logger.Warning?.Print(LogClass.ServiceBsd, $"Operation failed with error {errorCode}.");
+          +                    if (OperatingSystem.IsIOS() && errorCode == LinuxError.EBADF)
+          +                    {
+          +                        long count = Interlocked.Increment(ref _badDescriptorCount);
+          +                        if (count <= 8 || (count & 255) == 0)
+          +                            Logger.Warning?.Print(LogClass.ServiceBsd, $"Operation failed with error {errorCode} (occurrence {count}, repeated messages limited).");
+          +                    }
+          +                    else
+          +                    {
+          +                        Logger.Warning?.Print(LogClass.ServiceBsd, $"Operation failed with error {errorCode}.");
+          +                    }
+                           }
+           
+                           result = -1;
+          A19_V05_PATCH
+          git apply --check "$RUNNER_TEMP/a19-v05.patch"
+          git apply "$RUNNER_TEMP/a19-v05.patch"
+          cat > "$RUNNER_TEMP/a19-v06.patch" <<'A19_V06_PATCH'
+          --- a/src/MeloNX/MeloNX/Common/A19Bench.c
+          +++ b/src/MeloNX/MeloNX/Common/A19Bench.c
+          @@ -107,13 +107,13 @@
+               double previous = start, previousWrite = 0;
+               int sequence = 0;
+               while (atomic_load(&trace_running) && sequence <= 600) {
+          -        int64_t values[61];
+          +        int64_t values[67];
+                   double now = ns();
+          -        if (a19_probe_read(values, 61) != 61) { atomic_store(&trace_error, 2); break; }
+          +        if (a19_probe_read(values, 67) != 67) { atomic_store(&trace_error, 2); break; }
+                   int64_t cpu = a19_cpu_time_us();
+                   uint64_t footprint = trace_footprint(), available = a19_available_memory();
+                   fprintf(f, "{\"type\":\"sample\",\"seq\":%d,\"elapsedSeconds\":%.6f,\"intervalSeconds\":%.6f,\"processCPUTimeUs\":%" PRId64 ",\"footprintBytes\":%" PRIu64 ",\"availableProcessBytes\":%" PRIu64 ",\"previousWriteMs\":%.3f,\"counters\":[", sequence, (now-start)/1e9, (now-previous)/1e9, cpu, footprint, available, previousWrite);
+          -        for (int i = 0; i < 61; i++) fprintf(f, "%s%" PRId64, i ? "," : "", values[i]);
+          +        for (int i = 0; i < 67; i++) fprintf(f, "%s%" PRId64, i ? "," : "", values[i]);
+                   fputs("]}\n", f);
+                   if (ferror(f) || !trace_flush(f)) { atomic_store(&trace_error, 3); break; }
+                   previousWrite = (ns()-now)/1e6;
+          @@ -137,7 +137,7 @@
+               atomic_store(&trace_count, 0); atomic_store(&trace_error, 0);
+               trace_file = fopen(path, "w");
+               if (!trace_file) return 0;
+          -    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":2,\"build\":\"A19 Lab 0.5\",\"stopwatchFrequency\":%" PRId64 ",\"counterMode\":\"cumulative except gauges 29-35 and 44-60\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\"]}\n", a19_probe_frequency());
+          +    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":2,\"build\":\"A19 Lab 0.6\",\"stopwatchFrequency\":%" PRId64 ",\"counterMode\":\"cumulative except gauges 29-35 and 44-60\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\",\"jit_masked_index_fusions\",\"native_fp16_guest_ops\",\"tile_clear_passes\",\"retained_block_reuses\",\"retained_block_reuse_bytes\",\"qos_set_failures\"]}\n", a19_probe_frequency());
+               if (!trace_flush(trace_file)) { fclose(trace_file); return 0; }
+               atomic_store(&trace_running, 1);
+               if (pthread_create(&trace_thread, NULL, trace_worker, NULL) != 0) {
+          --- a/src/MeloNX/MeloNX/Common/A19Lab.swift
+          +++ b/src/MeloNX/MeloNX/Common/A19Lab.swift
+          @@ -7,6 +7,7 @@
+           
+           @_silgen_name("a19_probe_enable") private func a19Enable(_ enabled: Int32)
+           @_silgen_name("a19_probe_options") private func a19Options(_ argumentBuffers: Int32, _ commandLimit: Int32, _ shaderWorkers: Int32, _ jitPadCalls: Int32)
+          +@_silgen_name("a19_probe_experiments") private func a19Experiments(_ mask: Int32)
+           @_silgen_name("a19_probe_frequency") private func a19Frequency() -> Int64
+           @_silgen_name("a19_probe_read") private func a19Read(_ output: UnsafeMutablePointer<Int64>, _ count: Int32) -> Int32
+           @_silgen_name("a19_cpu_benchmark") private nonisolated func a19CpuBench(_ output: UnsafeMutablePointer<Double>, _ count: Int32) -> Int32
+          @@ -22,7 +23,8 @@
+               "jit_compiles", "jit_compile_ticks", "jit_host_code_bytes", "jit_guest_code_bytes", "jit_shared_copy_bytes", "jit_local_copy_bytes", "jit_local_page_bytes", "jit_pad_calls", "jit_pad_ticks", "jit_local_icache_calls", "jit_local_icache_ticks",
+               "fence_wait_calls", "fence_wait_ticks", "queue_submit_calls", "queue_submit_ticks", "pipeline_create_calls", "pipeline_create_ticks", "mapped_upload_bytes", "mirror_upload_bytes", "background_compile_jobs", "background_compile_ticks",
+               "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes",
+          -    "mvk_statistics_result", "mvk_spirv_to_msl_count", "mvk_spirv_to_msl_avg_us", "mvk_msl_compile_count", "mvk_msl_compile_avg_us", "mvk_shader_cache_count", "mvk_shader_cache_avg_us", "mvk_pipeline_compile_count", "mvk_pipeline_compile_avg_us", "mvk_retrieve_command_count", "mvk_retrieve_command_avg_us", "mvk_encode_command_count", "mvk_encode_command_avg_us", "mvk_execute_command_count", "mvk_execute_command_avg_us", "mvk_gpu_memory_count", "mvk_gpu_memory_avg_kib_x1000"
+          +    "mvk_statistics_result", "mvk_spirv_to_msl_count", "mvk_spirv_to_msl_avg_us", "mvk_msl_compile_count", "mvk_msl_compile_avg_us", "mvk_shader_cache_count", "mvk_shader_cache_avg_us", "mvk_pipeline_compile_count", "mvk_pipeline_compile_avg_us", "mvk_retrieve_command_count", "mvk_retrieve_command_avg_us", "mvk_encode_command_count", "mvk_encode_command_avg_us", "mvk_execute_command_count", "mvk_execute_command_avg_us", "mvk_gpu_memory_count", "mvk_gpu_memory_avg_kib_x1000",
+          +    "jit_masked_index_fusions", "native_fp16_guest_ops", "tile_clear_passes", "retained_block_reuses", "retained_block_reuse_bytes", "qos_set_failures"
+           ]
+           private let a19Gauges = Set(29...35).union(44...60)
+           
+          @@ -117,6 +119,14 @@
+               @Published var commandLimit = 0
+               @Published var shaderWorkers = 0
+               @Published var jitPadCalls = 0
+          +    @Published var compactJIT = false
+          +    @Published var nativeFP16 = false
+          +    @Published var tileClear = false
+          +    @Published var reuseBlocks = false
+          +    @Published var workerQoS = false
+          +    private var experimentMask: Int {
+          +        (compactJIT ? 1 : 0) | (nativeFP16 ? 2 : 0) | (tileClear ? 4 : 0) | (reuseBlocks ? 8 : 0) | (workerQoS ? 16 : 0)
+          +    }
+               private var task: Task<Void, Never>?
+               private var samples: [A19Sample] = []
+               private var benchmarks: [String: Double] = [:]
+          @@ -127,7 +137,7 @@
+               private var gameStartSeconds: Double?
+               private var gameEndSeconds: Double?
+               private var gameExitCode: Int?
+          -    private var previous = [Int64](repeating: 0, count: 61)
+          +    private var previous = [Int64](repeating: 0, count: 67)
+               private var started = 0.0
+               private var lastTime = 0.0
+               private var lastCpu: Int64 = -1
+          @@ -143,8 +153,9 @@
+                   if FileManager.default.fileExists(atPath: traceDestination.path) { traceURL = traceDestination }
+               }
+               func apply() {
+          -        guard !running && !benchmarking else { return }
+          +        guard !running && !benchmarking && !RyujinxController.shared.isEngineActive && !RyujinxController.shared.isRunning.isRunning() else { return }
+                   a19Options(Int32(argumentBuffers), Int32(commandLimit), Int32(shaderWorkers), Int32(jitPadCalls))
+          +        a19Experiments(Int32(experimentMask))
+                   status = "Options applied for next game."
+               }
+               private func metadata() -> [String: String] {
+          @@ -167,7 +178,7 @@
+                   return result
+               }
+               func benchmark() {
+          -        guard !running && !benchmarking && !RyujinxController.shared.isRunning.isRunning() else { return }
+          +        guard !running && !benchmarking && !RyujinxController.shared.isEngineActive && !RyujinxController.shared.isRunning.isRunning() else { return }
+                   benchmarking = true; status = "Measuring CPU and Metal…"; hardware = metadata()
+                   Task {
+                       let values = await Task.detached(priority: .userInitiated) {
+          @@ -179,12 +190,12 @@
+                       hardware["thermalAfterBenchmark"] = String(ProcessInfo.processInfo.thermalState.rawValue)
+                       benchmarkHardware = hardware
+                       benchmarking = false; status = "Benchmark finished: \(values.count) measurements."
+          -            selected = ["argumentBuffers":argumentBuffers,"commandLimit":commandLimit,"shaderWorkers":shaderWorkers,"jitPadCalls":jitPadCalls]
+          +            selected = ["argumentBuffers":argumentBuffers,"commandLimit":commandLimit,"shaderWorkers":shaderWorkers,"jitPadCalls":jitPadCalls,"experimentMask":experimentMask]
+                       samples = []; sampleCount = 0; gameSettings = [:]; gameStartSeconds = nil; gameEndSeconds = nil; gameExitCode = nil; writeReport()
+                   }
+               }
+               private func read() -> [Int64]? {
+          -        var result = [Int64](repeating: 0, count: 61)
+          +        var result = [Int64](repeating: 0, count: 67)
+                   let count = result.withUnsafeMutableBufferPointer { a19Read($0.baseAddress!, Int32($0.count)) }
+                   return count == Int32(result.count) ? result : nil
+               }
+          @@ -209,11 +220,11 @@
+                   stop()
+               }
+               func start() {
+          -        guard !running && !benchmarking else { return }
+          +        guard !running && !benchmarking && !RyujinxController.shared.isEngineActive && !RyujinxController.shared.isRunning.isRunning() else { return }
+                   guard let initial = read() else { status = "Core telemetry ABI unavailable."; return }
+                   apply(); previous = initial; hardware = metadata(); samples = []; sampleCount = 0
+                   gameSettings = [:]; gameStartSeconds = nil; gameEndSeconds = nil; gameExitCode = nil
+          -        selected = ["argumentBuffers":argumentBuffers,"commandLimit":commandLimit,"shaderWorkers":shaderWorkers,"jitPadCalls":jitPadCalls]
+          +        selected = ["argumentBuffers":argumentBuffers,"commandLimit":commandLimit,"shaderWorkers":shaderWorkers,"jitPadCalls":jitPadCalls,"experimentMask":experimentMask]
+                   started = ProcessInfo.processInfo.systemUptime; lastTime = started; lastCpu = a19CpuTime()
+                   a19Enable(1)
+                   guard traceDestination.path.withCString({ a19TraceStart($0) }) == 1 else {
+          @@ -248,7 +259,7 @@
+                   writeReport()
+               }
+               private func writeReport() {
+          -        let report = A19Report(schemaVersion: 2, build: "A19 Lab 0.5", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Native JSONL counters are cumulative except gauges at indices 29–35 and 44–60; export both files. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
+          +        let report = A19Report(schemaVersion: 2, build: "A19 Lab 0.6", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Native JSONL counters are cumulative except gauges at indices 29–35 and 44–60; export both files. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
+                   do { let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]; try encoder.encode(report).write(to: destination, options: .atomic); reportURL = destination }
+                   catch { status = "Report could not be saved." }
+               }
+          @@ -267,6 +278,11 @@
+                           Picker("Metal command limit", selection: $lab.commandLimit) { Text("Original").tag(0); Text("32").tag(32); Text("64").tag(64); Text("128").tag(128) }
+                           Picker("Shader workers", selection: $lab.shaderWorkers) { Text("Original").tag(0); Text("1").tag(1); Text("2").tag(2) }
+                           Picker("JIT promotion threshold", selection: $lab.jitPadCalls) { Text("Original (8)").tag(0); Text("4").tag(4); Text("8").tag(8); Text("16").tag(16) }
+          +                Toggle("ARM64 compact page index", isOn: $lab.compactJIT)
+          +                Toggle("Native FP16 (restricted experiment)", isOn: $lab.nativeFP16)
+          +                Toggle("TBDR full color clear", isOn: $lab.tileClear)
+          +                Toggle("Bounded Vulkan block reuse", isOn: $lab.reuseBlocks)
+          +                Toggle("Shader worker QoS", isOn: $lab.workerQoS)
+                           Button("Apply for next game") { lab.apply() }
+                       }.disabled(lab.running || lab.benchmarking)
+                       Section("Core trace") {
+          --- a/src/MeloNX/MeloNX/Core/RyujinxController.swift
+          +++ b/src/MeloNX/MeloNX/Core/RyujinxController.swift
+          @@ -168,6 +168,7 @@
+               }
+               private var controllerManager: ControllerManager = .shared
+               private var emulationThreadActive = false
+          +    var isEngineActive: Bool { emulationThreadActive }
+               
+               var firmwareVersion: String {
+                   return Ryujinx.installedFirmwareVersion
+          --- a/src/Ryujinx.Common/A19Probe.cs
+          +++ b/src/Ryujinx.Common/A19Probe.cs
+          @@ -7,11 +7,16 @@
+               // Cumulative counters; snapshots are deliberately non-blocking and approximate across threads.
+               public static class A19Probe
+               {
+          -        public const int Count = 61;
+          +        public const int Count = 67;
+                   // A19 reports 128-byte cache lines. 256-byte stride also prevents adjacent counters sharing a line.
+                   private const int Stride = 32;
+                   private static readonly long[] Values = new long[Count * Stride];
+                   private static int _enabled, _argumentBuffers, _commandLimit, _shaderWorkers, _jitPadCalls;
+          +        private static int _experiments, _nativeHalfSupported;
+          +        public static bool Experiment(int mask) => OperatingSystem.IsIOS() && (Volatile.Read(ref _experiments) & mask) != 0;
+          +        public static bool NativeHalf => Experiment(2) && Volatile.Read(ref _nativeHalfSupported) != 0;
+          +        public static void SetExperiments(int mask) => Volatile.Write(ref _experiments, mask & 31);
+          +        public static void SetNativeHalfSupported(bool supported) => Volatile.Write(ref _nativeHalfSupported, supported ? 1 : 0);
+                   public static bool Enabled => Volatile.Read(ref _enabled) != 0;
+                   public static int ArgumentBuffers => Volatile.Read(ref _argumentBuffers);
+                   public static int CommandLimit => Volatile.Read(ref _commandLimit);
+          --- a/src/Ryujinx.Cpu/LightningJit/Arm64/Target/Arm64/InstEmitMemory.cs
+          +++ b/src/Ryujinx.Cpu/LightningJit/Arm64/Target/Arm64/InstEmitMemory.cs
+          @@ -1,4 +1,5 @@
+           using ARMeilleure.Memory;
+          +using Ryujinx.Common;
+           using Ryujinx.Cpu.LightningJit.CodeGen;
+           using Ryujinx.Cpu.LightningJit.CodeGen.Arm64;
+           using System;
+          @@ -503,7 +504,7 @@
+                           // They are assumed to be on different registers, otherwise this operation will thrash the address.
+                           Debug.Assert(destination.Value != guestAddress.Value);
+           
+          -                if (Math.Abs(offset) >= 0x1000)
+          +                if (Math.Abs(offset) >= 0x1000 && !(A19Probe.Experiment(1) && (offset & 0xfff) == 0 && Math.Abs((long)offset) < 0x1000000))
+                           {
+                               // Too high to encode as 12-bit immediate, do a separate move.
+                               asm.Mov(destination, (ulong)offset);
+          @@ -550,11 +551,21 @@
+           
+                           Operand pte = new(tempRegister, RegisterType.Integer, OperandType.I64);
+           
+          -                asm.Lsr(pte, guestAddress, new Operand(OperandKind.Constant, OperandType.I32, 12));
+          -
+          -                if (mmType == MemoryManagerType.HostTracked)
+          -                {
+          -                    asm.And(pte, pte, new Operand(OperandKind.Constant, OperandType.I64, ulong.MaxValue >> (64 - (asBits - 12))));
+          +                // UBFX extracts exactly the same masked page index as LSR + AND, without modifying flags.
+          +                // SP must not be used as the bitfield source (register 31 would encode ZR).
+          +                if (A19Probe.Experiment(1) && mmType == MemoryManagerType.HostTracked &&
+          +                    asBits > 12 && asBits < 64 && guestAddress.Value != 31)
+          +                {
+          +                    asm.Ubfx(pte, guestAddress, 12, asBits - 12);
+          +                    A19Probe.Add(61);
+          +                }
+          +                else
+          +                {
+          +                    asm.Lsr(pte, guestAddress, new Operand(OperandKind.Constant, OperandType.I32, 12));
+          +                    if (mmType == MemoryManagerType.HostTracked)
+          +                    {
+          +                        asm.And(pte, pte, new Operand(OperandKind.Constant, OperandType.I64, ulong.MaxValue >> (64 - (asBits - 12))));
+          +                    }
+                           }
+           
+                           asm.LdrRr(pte, basePointer, pte, ArmExtensionType.Uxtx, true);
+          --- a/src/Ryujinx.Graphics.Gpu/Shader/ShaderCache.cs
+          +++ b/src/Ryujinx.Graphics.Gpu/Shader/ShaderCache.cs
+          @@ -118,7 +118,7 @@
+                   private static string GetDiskCachePath()
+                   {
+                       return GraphicsConfig.EnableShaderCache && GraphicsConfig.TitleId != null
+          -                ? Path.Combine(AppDataManager.GamesDirPath, GraphicsConfig.TitleId.ToLower(), "cache", "shader")
+          +                ? Path.Combine(AppDataManager.GamesDirPath, GraphicsConfig.TitleId.ToLower(), "cache", Ryujinx.Common.A19Probe.Experiment(2) ? "shader-a19-fp16-v1" : "shader")
+                           : null;
+                   }
+           
+          --- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+          +++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+          @@ -79,6 +79,16 @@
+                   public AstBlock CurrentBlock { get; private set; }
+           
+                   public SpirvDelegates Delegates { get; }
+          +        private bool _a19Float16Declared;
+          +
+          +        public void RequireA19Float16()
+          +        {
+          +            if (!_a19Float16Declared)
+          +            {
+          +                AddCapability(Spv.Specification.Capability.Float16);
+          +                _a19Float16Declared = true;
+          +            }
+          +        }
+           
+                   public bool IsMainFunction { get; private set; }
+                   public bool MayHaveReturned { get; set; }
+          --- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+          +++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+          @@ -117,6 +117,8 @@
+                       Add(Instruction.MultiplyHighU32,          GenerateMultiplyHighU32);
+                       Add(Instruction.Negate,                   GenerateNegate);
+                       Add(Instruction.PackDouble2x32,           GeneratePackDouble2x32);
+          +            Add(Instruction.A19PackedHalfAdd,         GenerateA19PackedHalfAdd);
+          +            Add(Instruction.A19PackedHalfMultiply,    GenerateA19PackedHalfMultiply);
+                       Add(Instruction.PackHalf2x16,             GeneratePackHalf2x16);
+                       Add(Instruction.ReciprocalSquareRoot,     GenerateReciprocalSquareRoot);
+                       Add(Instruction.Return,                   GenerateReturn);
+          @@ -996,6 +998,22 @@
+                       return new OperationResult(AggregateType.FP64, result);
+                   }
+           
+          +        private static OperationResult GenerateA19PackedHalfAdd(CodeGenContext context, AstOperation operation) =>
+          +            GenerateA19PackedHalf(context, operation, true);
+          +
+          +        private static OperationResult GenerateA19PackedHalfMultiply(CodeGenContext context, AstOperation operation) =>
+          +            GenerateA19PackedHalf(context, operation, false);
+          +
+          +        private static OperationResult GenerateA19PackedHalf(CodeGenContext context, AstOperation operation, bool add)
+          +        {
+          +            context.RequireA19Float16();
+          +            SpvInstruction type = context.TypeVector(context.TypeFloat(16), 2);
+          +            SpvInstruction a = context.Bitcast(type, context.GetU32(operation.GetSource(0)));
+          +            SpvInstruction b = context.Bitcast(type, context.GetU32(operation.GetSource(1)));
+          +            SpvInstruction result = add ? context.FAdd(type, a, b) : context.FMul(type, a, b);
+          +            return new OperationResult(AggregateType.U32, context.Bitcast(context.TypeU32(), result));
+          +        }
+          +
+                   private static OperationResult GeneratePackHalf2x16(CodeGenContext context, AstOperation operation)
+                   {
+                       SpvInstruction value0 = context.GetFP32(operation.GetSource(0));
+          --- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitFloatArithmetic.cs
+          +++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitFloatArithmetic.cs
+          @@ -1,3 +1,4 @@
+          +using Ryujinx.Common;
+           using Ryujinx.Graphics.Shader.Decoders;
+           using Ryujinx.Graphics.Shader.IntermediateRepresentation;
+           using Ryujinx.Graphics.Shader.Translation;
+          @@ -251,6 +252,15 @@
+                   public static void Hadd2R(EmitterContext context)
+                   {
+                       InstHadd2R op = context.GetOp<InstHadd2R>();
+          +            if (A19Probe.NativeHalf && context.TranslatorContext?.Options.TargetLanguage == TargetLanguage.Spirv &&
+          +                op.OFmt == OFmt.F16 && op.ASwizzle == HalfSwizzle.F16 && op.BSwizzle == HalfSwizzle.F16 &&
+          +                !op.NegA && !op.NegB && !op.AbsA && !op.AbsB && !op.Sat && !op.Ftz)
+          +            {
+          +                context.Copy(GetDest(op.Dest), context.Add(Instruction.A19PackedHalfAdd, Local(),
+          +                    GetSrcReg(context, op.SrcA), GetSrcReg(context, op.SrcB)));
+          +                A19Probe.Add(62);
+          +                return;
+          +            }
+           
+                       Operand[] srcA = GetHalfSrc(context, op.ASwizzle, op.SrcA, op.NegA, op.AbsA);
+                       Operand[] srcB = GetHalfSrc(context, op.BSwizzle, op.SrcB, op.NegB, op.AbsB);
+          @@ -346,6 +356,15 @@
+                   public static void Hmul2R(EmitterContext context)
+                   {
+                       InstHmul2R op = context.GetOp<InstHmul2R>();
+          +            if (A19Probe.NativeHalf && context.TranslatorContext?.Options.TargetLanguage == TargetLanguage.Spirv &&
+          +                op.OFmt == OFmt.F16 && op.ASwizzle == HalfSwizzle.F16 && op.BSwizzle == HalfSwizzle.F16 &&
+          +                !op.NegA && !op.AbsA && !op.AbsB && !op.Sat && (int)op.Fmz == 0)
+          +            {
+          +                context.Copy(GetDest(op.Dest), context.Add(Instruction.A19PackedHalfMultiply, Local(),
+          +                    GetSrcReg(context, op.SrcA), GetSrcReg(context, op.SrcB)));
+          +                A19Probe.Add(62);
+          +                return;
+          +            }
+           
+                       Operand[] srcA = GetHalfSrc(context, op.ASwizzle, op.SrcA, false, op.AbsA);
+                       Operand[] srcB = GetHalfSrc(context, op.BSwizzle, op.SrcB, op.NegA, op.AbsB);
+          --- a/src/Ryujinx.Graphics.Shader/IntermediateRepresentation/Instruction.cs
+          +++ b/src/Ryujinx.Graphics.Shader/IntermediateRepresentation/Instruction.cs
+          @@ -126,6 +126,9 @@
+                   VoteAllEqual,
+                   VoteAny,
+           
+          +        A19PackedHalfAdd,
+          +        A19PackedHalfMultiply,
+          +
+                   Count,
+           
+                   FP32 = 1 << 16,
+          --- a/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
+          +++ b/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
+          @@ -107,6 +107,8 @@
+                       Add(Instruction.MultiplyHighU32,          AggregateType.U32,    AggregateType.U32,     AggregateType.U32);
+                       Add(Instruction.Negate,                   AggregateType.Scalar, AggregateType.Scalar);
+                       Add(Instruction.PackDouble2x32,           AggregateType.FP64,   AggregateType.U32,     AggregateType.U32);
+          +            Add(Instruction.A19PackedHalfAdd,         AggregateType.U32,    AggregateType.U32,     AggregateType.U32);
+          +            Add(Instruction.A19PackedHalfMultiply,    AggregateType.U32,    AggregateType.U32,     AggregateType.U32);
+                       Add(Instruction.PackHalf2x16,             AggregateType.U32,    AggregateType.FP32,    AggregateType.FP32);
+                       Add(Instruction.ReciprocalSquareRoot,     AggregateType.Scalar, AggregateType.Scalar);
+                       Add(Instruction.Return,                   AggregateType.Void,   AggregateType.U32);
+          --- a/src/Ryujinx.Graphics.Vulkan/BackgroundCompilationScheduler.cs
+          +++ b/src/Ryujinx.Graphics.Vulkan/BackgroundCompilationScheduler.cs
+          @@ -3,6 +3,7 @@
+           using System.Collections.Generic;
+           using System.Threading;
+           using System.Threading.Tasks;
+          +using System.Runtime.InteropServices;
+           
+           namespace Ryujinx.Graphics.Vulkan
+           {
+          @@ -43,15 +44,33 @@
+           
+                   private sealed class WorkerQueue : IDisposable
+                   {
+          +            [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "pthread_set_qos_class_self_np")]
+          +            private static extern int SetSelfQos(uint qos, int priority);
+          +
+          +            private static void ApplyQos(bool highPriority)
+          +            {
+          +                if (!A19Probe.Experiment(16)) return;
+          +                try
+          +                {
+          +                    // USER_INITIATED for explicitly urgent jobs, UTILITY for background work.
+          +                    if (SetSelfQos(highPriority ? 0x19u : 0x11u, 0) != 0) A19Probe.Add(66);
+          +                }
+          +                catch (EntryPointNotFoundException) { A19Probe.Add(66); }
+          +                catch (DllNotFoundException) { A19Probe.Add(66); }
+          +            }
+          +
+                       private sealed class WorkItem
+                       {
+                           private readonly Action _action;
+           
+                           public TaskCompletionSource<bool> Completion { get; }
+           
+          -                public WorkItem(Action action)
+          +                public bool HighPriority { get; }
+          +
+          +                public WorkItem(Action action, bool highPriority)
+                           {
+                               _action = action;
+          +                    HighPriority = highPriority;
+                               Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                           }
+           
+          @@ -104,7 +123,7 @@
+           
+                       public Task Schedule(Action action, bool highPriority)
+                       {
+          -                WorkItem item = new(action);
+          +                WorkItem item = new(action, highPriority);
+           
+                           lock (_queueLock)
+                           {
+          @@ -127,6 +146,7 @@
+           
+                       private void WorkerLoop()
+                       {
+          +                bool? lastQos = null;
+                           while (true)
+                           {
+                               _signal.Wait();
+          @@ -153,6 +173,11 @@
+                                   }
+                               }
+           
+          +                    if (lastQos != item.HighPriority)
+          +                    {
+          +                        ApplyQos(item.HighPriority);
+          +                        lastQos = item.HighPriority;
+          +                    }
+                               long workStart = A19Probe.Start();
+                               item.Execute();
+                               A19Probe.End(workStart, 27, 28);
+          --- a/src/Ryujinx.Graphics.Vulkan/MemoryAllocatorBlockList.cs
+          +++ b/src/Ryujinx.Graphics.Vulkan/MemoryAllocatorBlockList.cs
+          @@ -4,6 +4,7 @@
+           using System.Collections.Generic;
+           using System.Diagnostics;
+           using System.Threading;
+          +using System.Runtime.InteropServices;
+           
+           namespace Ryujinx.Graphics.Vulkan
+           {
+          @@ -158,6 +159,28 @@
+                   }
+           
+                   private readonly List<Block> _blocks;
+          +        private Block _retainedBlock;
+          +        private static long _retainedBytes;
+          +        private const long RetainedLimit = 32L * 1024 * 1024;
+          +        private const ulong PerBlockLimit = 8UL * 1024 * 1024;
+          +        [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "os_proc_available_memory")]
+          +        private static extern nuint AvailableProcessMemory();
+          +
+          +        private static bool HasMemoryHeadroom()
+          +        {
+          +            if (!A19Probe.Experiment(8)) return false;
+          +            try { return AvailableProcessMemory() >= 512UL * 1024 * 1024; }
+          +            catch (EntryPointNotFoundException) { return false; }
+          +            catch (DllNotFoundException) { return false; }
+          +        }
+          +
+          +        // Only called under the list write lock.
+          +        private void ReleaseRetention()
+          +        {
+          +            if (_retainedBlock == null) return;
+          +            Interlocked.Add(ref _retainedBytes, -(long)_retainedBlock.Size);
+          +            _retainedBlock = null;
+          +        }
+           
+                   private readonly Vk _api;
+                   private readonly Device _device;
+          @@ -201,6 +224,12 @@
+                                   ulong offset = block.Allocate(size, alignment);
+                                   if (offset != InvalidOffset)
+                                   {
+          +                            if (ReferenceEquals(block, _retainedBlock))
+          +                            {
+          +                                ReleaseRetention();
+          +                                A19Probe.Add(64);
+          +                                A19Probe.Add(65, (long)size);
+          +                            }
+                                       return new MemoryAllocation(this, block, block.Memory, GetHostPointer(block, offset), offset, size);
+                                   }
+                               }
+          @@ -258,13 +287,28 @@
+                   public void Free(Block block, ulong offset, ulong size)
+                   {
+                       bool destroy = false;
+          +            Block trim = null;
+          +            bool headroom = HasMemoryHeadroom();
+                       _lock.EnterWriteLock();
+                       try
+                       {
+                           block.Free(offset, size);
+          +                if (!headroom && _retainedBlock != null)
+          +                {
+          +                    trim = _retainedBlock;
+          +                    ReleaseRetention();
+          +                    _blocks.Remove(trim);
+          +                }
+                           if (block.IsTotallyFree())
+                           {
+          -                    destroy = _blocks.Remove(block);
+          +                    bool keep = false;
+          +                    if (headroom && _retainedBlock == null && block.Size <= PerBlockLimit)
+          +                    {
+          +                        long total = Interlocked.Add(ref _retainedBytes, (long)block.Size);
+          +                        if (total <= RetainedLimit) { _retainedBlock = block; keep = true; }
+          +                        else Interlocked.Add(ref _retainedBytes, -(long)block.Size);
+          +                    }
+          +                    if (!keep) destroy = _blocks.Remove(block);
+                           }
+                       }
+                       finally
+          @@ -273,6 +317,7 @@
+                       }
+                       // The block is unreachable by Allocate before freeing the Vulkan resource.
+                       if (destroy) block.Destroy(_api, _device);
+          +            trim?.Destroy(_api, _device);
+                   }
+           
+                   private void InsertBlock(Block block)
+          @@ -297,6 +342,8 @@
+           
+                   public void Dispose()
+                   {
+          +            // Renderer disposal is already performed after its worker threads have stopped.
+          +            ReleaseRetention();
+                       for (int i = 0; i < _blocks.Count; i++)
+                       {
+                           _blocks[i].Destroy(_api, _device);
+          --- a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
+          +++ b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
+          @@ -22,7 +22,8 @@
+                   public static void Initialize()
+                   {
+                       A19Probe.Set(44, -104); // no native statistics sampled for this device yet
+          -            for (int i = 45; i < A19Probe.Count; i++) A19Probe.Set(i, 0);
+          +            _statsUnavailable = false;
+          +            for (int i = 45; i <= 60; i++) A19Probe.Set(i, 0);
+                       nint configSize = (nint)Marshal.SizeOf<MVKConfiguration>();
+           
+                       Result getResult = vkGetMoltenVKConfigurationMVK(nint.Zero, out MVKConfiguration config, ref configSize);
+          --- a/src/Ryujinx.Graphics.Vulkan/PipelineBase.cs
+          +++ b/src/Ryujinx.Graphics.Vulkan/PipelineBase.cs
+          @@ -1,3 +1,4 @@
+          +using Ryujinx.Common;
+           using Ryujinx.Common.Memory;
+           using Ryujinx.Graphics.GAL;
+           using Ryujinx.Graphics.Shader;
+          @@ -218,12 +219,20 @@
+           
+                       Gd.Barriers.Flush(Cbs, RenderPassActive, _rpHolder, EndRenderPassDelegate);
+           
+          -            BeginRenderPass();
+          -
+                       ClearValue clearValue = new(new ClearColorValue(color.Red, color.Green, color.Blue, color.Alpha));
+                       ClearAttachment attachment = new(ImageAspectFlags.ColorBit, (uint)index, clearValue);
+                       ClearRect clearRect = FramebufferParams.GetClearRect(ClearScissor, layer, layerCount);
+          -
+          +            if (!RenderPassActive && _rpHolder.GetClearRenderPass() != null &&
+          +                clearRect.Rect.Offset.X == 0 && clearRect.Rect.Offset.Y == 0 &&
+          +                clearRect.Rect.Extent.Width == FramebufferParams.Width && clearRect.Rect.Extent.Height == FramebufferParams.Height &&
+          +                layer == 0 && layerCount > 0 && (uint)layerCount == FramebufferParams.Layers)
+          +            {
+          +                BeginRenderPass(clearValue);
+          +                A19Probe.Add(63);
+          +                return;
+          +            }
+          +
+          +            BeginRenderPass();
+                       Gd.Api.CmdClearAttachments(CommandBuffer, 1, &attachment, 1, &clearRect);
+                   }
+           
+          @@ -1869,19 +1878,20 @@
+                       return true;
+                   }
+           
+          -        private unsafe void BeginRenderPass()
+          +        private unsafe void BeginRenderPass(ClearValue? initialColor = null)
+                   {
+                       if (!RenderPassActive)
+                       {
+                           FramebufferParams.InsertLoadOpBarriers(Gd, Cbs);
+           
+                           Rect2D renderArea = new(null, new Extent2D(FramebufferParams.Width, FramebufferParams.Height));
+          -                ClearValue clearValue = new();
+          +                ClearValue clearValue = initialColor.GetValueOrDefault();
+          +                Auto<DisposableRenderPass> activePass = initialColor.HasValue ? _rpHolder.GetClearRenderPass() : _renderPass;
+           
+                           RenderPassBeginInfo renderPassBeginInfo = new()
+                           {
+                               SType = StructureType.RenderPassBeginInfo,
+          -                    RenderPass = _renderPass.Get(Cbs).Value,
+          +                    RenderPass = activePass.Get(Cbs).Value,
+                               Framebuffer = _framebuffer.Get(Cbs).Value,
+                               RenderArea = renderArea,
+                               PClearValues = &clearValue,
+          --- a/src/Ryujinx.Graphics.Vulkan/RenderPassHolder.cs
+          +++ b/src/Ryujinx.Graphics.Vulkan/RenderPassHolder.cs
+          @@ -1,3 +1,4 @@
+          +using Ryujinx.Common;
+           using Silk.NET.Vulkan;
+           using System;
+           using System.Collections.Generic;
+          @@ -35,6 +36,7 @@
+           
+                   private readonly TextureView[] _textures;
+                   private readonly Auto<DisposableRenderPass> _renderPass;
+          +        private readonly Auto<DisposableRenderPass> _clearRenderPass;
+                   private readonly HashTableSlim<FramebufferCacheKey, Auto<DisposableFramebuffer>> _framebuffers;
+                   private readonly RenderPassCacheKey _key;
+                   private readonly List<ForcedFence> _forcedFences;
+          @@ -128,6 +130,14 @@
+                           gd.Api.CreateRenderPass(device, in renderPassCreateInfo, null, out RenderPass renderPass).ThrowOnError();
+           
+                           _renderPass = new Auto<DisposableRenderPass>(new DisposableRenderPass(gd.Api, device, renderPass));
+          +                if (A19Probe.Experiment(4) && fb != null && fb.AttachmentsCount == 1 && !fb.HasDepthStencil &&
+          +                    fb.AttachmentIntegerFormatMask == 0 && fb.AttachmentSamples[0] == 1)
+          +                {
+          +                    // Same format, samples, layouts, dependencies and subpass; only loadOp differs.
+          +                    pAttachmentDescs[0].LoadOp = AttachmentLoadOp.Clear;
+          +                    if (gd.Api.CreateRenderPass(device, in renderPassCreateInfo, null, out RenderPass clearPass) == Result.Success)
+          +                        _clearRenderPass = new Auto<DisposableRenderPass>(new DisposableRenderPass(gd.Api, device, clearPass));
+          +                }
+                       }
+           
+                       _framebuffers = new HashTableSlim<FramebufferCacheKey, Auto<DisposableFramebuffer>>();
+          @@ -165,6 +175,8 @@
+                   {
+                       return _renderPass;
+                   }
+          +
+          +        public Auto<DisposableRenderPass> GetClearRenderPass() => _clearRenderPass;
+           
+                   public void AddForcedFence(TextureStorage storage, PipelineStageFlags stageFlags)
+                   {
+          @@ -214,6 +226,7 @@
+           
+                       // Dispose render pass.
+           
+          +            _clearRenderPass?.Dispose();
+                       _renderPass.Dispose();
+                   }
+               }
+          --- a/src/Ryujinx.Graphics.Vulkan/VulkanInitialization.cs
+          +++ b/src/Ryujinx.Graphics.Vulkan/VulkanInitialization.cs
+          @@ -1,3 +1,4 @@
+          +using Ryujinx.Common;
+           using Ryujinx.Common.Configuration;
+           using Ryujinx.Common.Logging;
+           using Ryujinx.Graphics.GAL;
+          @@ -494,8 +495,10 @@
+                           UniformBufferStandardLayout = supportedPhysicalDeviceVulkan12Features.UniformBufferStandardLayout,
+                           UniformAndStorageBuffer8BitAccess = supportedPhysicalDeviceVulkan12Features.UniformAndStorageBuffer8BitAccess,
+                           StorageBuffer8BitAccess = supportedPhysicalDeviceVulkan12Features.StorageBuffer8BitAccess,
+          -            };
+          -
+          +                ShaderFloat16 = A19Probe.Experiment(2) && supportedPhysicalDeviceVulkan12Features.ShaderFloat16,
+          +            };
+          +
+          +            A19Probe.SetNativeHalfSupported(featuresVk12.ShaderFloat16);
+                       pExtendedFeatures = &featuresVk12;
+           
+                       PhysicalDeviceIndexTypeUint8FeaturesEXT featuresIndexU8;
+          --- a/src/Ryujinx.Library/Library.cs
+          +++ b/src/Ryujinx.Library/Library.cs
+          @@ -77,6 +77,9 @@
+                   public static void A19ProbeOptions(int argumentBuffers, int commandLimit, int shaderWorkers, int jitPadCalls) =>
+                       global::Ryujinx.Common.A19Probe.Options(argumentBuffers, commandLimit, shaderWorkers, jitPadCalls);
+           
+          +        [UnmanagedCallersOnly(EntryPoint = "a19_probe_experiments")]
+          +        public static void A19ProbeExperiments(int mask) => global::Ryujinx.Common.A19Probe.SetExperiments(mask);
+          +
+                   [UnmanagedCallersOnly(EntryPoint = "a19_probe_frequency")]
+                   public static long A19ProbeFrequency() => System.Diagnostics.Stopwatch.Frequency;
+           
+          A19_V06_PATCH
+          git apply --check "$RUNNER_TEMP/a19-v06.patch"
+          git apply "$RUNNER_TEMP/a19-v06.patch"
           chmod +x distribution/ios/a19/*.sh distribution/ios/build.sh
       - uses: actions/setup-dotnet@v4
         with:
@@ -1220,7 +2504,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: source/src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
-          key: core-a19-lab-d20de1e8b99acaae13ce-${{ steps.preflight.outputs.fingerprint }}-f925129209afd55927a0201d82285b8fa4b7ba30-${{ hashFiles('source/distribution/ios/build.sh') }}
+          key: core-a19-v06-e57e89418812c1449cb8b2e3-${{ steps.preflight.outputs.fingerprint }}-f925129209afd55927a0201d82285b8fa4b7ba30-${{ hashFiles('source/distribution/ios/build.sh') }}
       - name: Compile Ryujinx core if needed
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: distribution/ios/build.sh
@@ -1228,7 +2512,7 @@ jobs:
         run: |
           lipo -verify_arch arm64 src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
           nm -gU src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib > "$RUNNER_TEMP/a19-symbols.txt"
-          for symbol in a19_probe_enable a19_probe_options a19_probe_frequency a19_probe_read; do
+          for symbol in a19_probe_enable a19_probe_options a19_probe_experiments a19_probe_frequency a19_probe_read; do
             grep -q " _${symbol}$" "$RUNNER_TEMP/a19-symbols.txt" || { echo "Missing $symbol"; exit 1; }
           done
           touch .ci-core-cache-hit

@@ -4,6 +4,9 @@ on:
     branches: [a19-experimental]
     paths: ['a19-overlay.zip', '.github/workflows/a19-build.yml']
   workflow_dispatch:
+concurrency:
+  group: a19-${{ github.ref }}
+  cancel-in-progress: false
 permissions:
   contents: read
 jobs:
@@ -28,6 +31,360 @@ jobs:
         run: |
           echo 'dfd0e7c1bde9029aec5c2d2347086a15342995da135fec54842587796e04400f  ../a19-overlay.zip' | shasum -a 256 -c -
           unzip -oq ../a19-overlay.zip
+          cat > "$RUNNER_TEMP/a19-review.patch" <<'A19_REVIEW_PATCH'
+          --- a/src/MeloNX/MeloNX/Common/JIT/MeloNXJITCoordinator.swift
+          +++ b/src/MeloNX/MeloNX/Common/JIT/MeloNXJITCoordinator.swift
+          @@ -1,4 +1,5 @@
+           import Foundation
+          +import Combine
+           import SwiftUI
+           import UniformTypeIdentifiers
+           import UIKit
+          @@ -6,14 +7,14 @@
+           /// Store locally; never upload, log or put pairing records in the build archive.
+           @MainActor enum MeloNXPairingStore {
+               static var directory: URL {
+          -        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+          +        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                       .appendingPathComponent("StikJIT", isDirectory: true)
+               }
+               static var url: URL { directory.appendingPathComponent("pairingFile.plist") }
+               static var exists: Bool { FileManager.default.fileExists(atPath: url.path) }
+               static func data() throws -> Data { try Data(contentsOf: url) }
+               static func store(_ data: Data) throws {
+          -        guard let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+          +        guard data.count <= 1_048_576, let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+                         let dict = plist as? [String: Any],
+                         let pub = dict["public_key"] as? Data, pub.count == 32,
+                         let priv = dict["private_key"] as? Data, priv.count == 32,
+          @@ -21,11 +22,19 @@
+                       throw NSError(domain: "MeloNXJIT", code: 10, userInfo: [NSLocalizedDescriptionKey: "El archivo no es un registro de emparejamiento remoto válido."])
+                   }
+                   try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+          +        var privateDirectory = directory
+          +        var values = URLResourceValues()
+          +        values.isExcludedFromBackup = true
+          +        try privateDirectory.setResourceValues(values)
+                   try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+               }
+               static func importFile(_ source: URL) throws {
+                   let scoped = source.startAccessingSecurityScopedResource()
+                   defer { if scoped { source.stopAccessingSecurityScopedResource() } }
+          +        let size = try source.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+          +        guard size > 0 && size <= 1_048_576 else {
+          +            throw NSError(domain: "MeloNXJIT", code: 11, userInfo: [NSLocalizedDescriptionKey: "Archivo de emparejamiento inválido o demasiado grande."])
+          +        }
+                   try store(Data(contentsOf: source))
+               }
+           }
+          @@ -37,6 +46,7 @@
+               @Published private(set) var ready = false
+               private var monitor: Task<Void, Never>?
+               private var attemptedMapping = false
+          +    @Published private(set) var requiresRestart = false
+               private init() {}
+           
+               var signingStatus: String {
+          @@ -44,6 +54,8 @@
+               }
+               func report(_ message: String) { status = message }
+               private func gate() -> Data? {
+          +        guard !requiresRestart else { status = "Cerrá completamente MeloNX y volvé a abrirlo antes de reintentar."; return nil }
+          +        guard !OnDevicePairing.shared.active else { status = "Terminá o cancelá el emparejamiento primero."; return nil }
+                   guard #available(iOS 26.0, *) else { status = "Requiere iOS 26 o posterior."; return nil }
+                   if let reason = MeloNXBuiltInJIT.unavailableReason { status = reason; return nil }
+                   guard !AppEnvironment.shared.isInLiveContainer else { status = "JIT integrado no disponible dentro de LiveContainer."; return nil }
+          @@ -59,9 +71,14 @@
+                       self.busy = false
+                       switch result {
+                       case .success(let response): self.status = response.message
+          -            case .failure(let error): self.status = error.localizedDescription
+          -            }
+          -        }
+          +            case .failure(let error): self.handleHelperFailure(error)
+          +            }
+          +        }
+          +    }
+          +    private func handleHelperFailure(_ error: Error) {
+          +        let e = error as NSError
+          +        if e.domain == "MeloNXBuiltInJIT" && e.code == 9 { requiresRestart = true }
+          +        status = error.localizedDescription
+               }
+               func resetDDI() {
+                   guard !busy, gate() != nil else { return }
+          @@ -70,12 +87,12 @@
+                       self.busy = false
+                       switch result {
+                       case .success(let response): self.status = response.message
+          -            case .failure(let error): self.status = error.localizedDescription
+          +            case .failure(let error): self.handleHelperFailure(error)
+                       }
+                   }
+               }
+               func enable() {
+          -        guard !busy else { return }
+          +        guard !busy, !requiresRestart else { return }
+                   if RyujinxController.hasPreparedJITMemory && jitEnabled() {
+                       ready = true; status = "JIT listo."; return
+                   }
+          @@ -83,7 +100,15 @@
+                   guard let data = gate() else { return }
+                   // This first candidate targets the TXM path used by A19 / iOS 27.
+                   guard ProcessInfo.processInfo.hasTXM else { status = "Usá el método externo en dispositivos sin TXM."; return }
+          -        busy = true; attemptedMapping = false; status = "Activando JIT (LocalDevVPN debe estar conectado)…"
+          +        guard !checkDebugged() else {
+          +            requiresRestart = true
+          +            RyujinxController.finishIntegratedJIT(success: false)
+          +            status = "Se detectó una sesión de depuración anterior. Cerrá MeloNX antes de iniciar JIT integrado."
+          +            return
+          +        }
+          +        busy = true; attemptedMapping = false
+          +        RyujinxController.beginIntegratedJIT()
+          +        status = "Activando JIT (LocalDevVPN debe estar conectado)…"
+                   MeloNXBuiltInJIT.send(.enable(targetPID: getpid(), pairingData: data), started: {
+                       // The extension starts before debugserver attaches. Wait for the actual flag.
+                       self.monitor?.cancel()
+          @@ -92,7 +117,7 @@
+                               if checkDebugged() {
+                                   self.attemptedMapping = true
+                                   self.status = "Preparando memoria ejecutable…"
+          -                        if !RyujinxController.attemptToMapDualMapping() {
+          +                        if !RyujinxController.attemptToMapDualMapping(fromIntegratedHelper: true) {
+                                       self.status = "No se pudo preparar la memoria JIT. Cerrá y reabrí la app antes de reintentar."
+                                   }
+                                   return
+          @@ -104,9 +129,14 @@
+                       self.monitor?.cancel(); self.monitor = nil; self.busy = false
+                       switch result {
+                       case .success(let response):
+          -                self.ready = response.success && RyujinxController.hasPreparedJITMemory
+          -                self.status = self.ready ? "JIT listo." : (response.success ? "El helper terminó, pero no se validó la memoria JIT. Reiniciá la app." : response.message)
+          -            case .failure(let error): self.ready = false; self.status = error.localizedDescription
+          +                self.ready = response.success && self.attemptedMapping && RyujinxController.hasPreparedJITMemory && checkDebugged()
+          +                self.status = self.ready ? "JIT listo." : (response.success ? "El helper terminó, pero no se validó la memoria JIT. Reiniciá la app." : response.message + " — Cerrá y reabrí MeloNX.")
+          +            case .failure(let error): self.ready = false; self.status = error.localizedDescription + " — Cerrá y reabrí MeloNX."
+          +            }
+          +            self.requiresRestart = !self.ready
+          +            RyujinxController.finishIntegratedJIT(success: self.ready)
+          +            if self.requiresRestart {
+          +                MeloNXJITLog.log("jit-helper", "Session failed; restart required")
+                       }
+                   })
+               }
+          @@ -126,6 +156,9 @@
+                           Text(coordinator.signingStatus)
+                           Text(checkAppEntitlement("com.apple.developer.kernel.increased-memory-limit") ? "Memoria ampliada: presente" : "Memoria ampliada: ausente")
+                           Text(MeloNXBuiltInJIT.helperIdentifier == nil ? "Extensión JIT: ausente" : "Extensión JIT: presente")
+          +                Text(checkAppEntitlement("com.apple.developer.kernel.extended-virtual-addressing") ? "Direcciones virtuales ampliadas: presente" : "Direcciones virtuales ampliadas: ausente")
+          +                Text(Bundle.main.bundleIdentifier ?? "Bundle ID desconocido").font(.caption)
+          +                if coordinator.requiresRestart { Text("Cerrá completamente la app antes de volver a intentar JIT.").foregroundStyle(.red) }
+                       }
+                       Section("1. Emparejamiento") {
+                           Text(paired ? "Archivo de emparejamiento guardado" : "Sin emparejamiento")
+          @@ -147,9 +180,9 @@
+                       }
+                       Section("2. LocalDevVPN y JIT") {
+                           Text("Conectá LocalDevVPN y regresá a MeloNX.")
+          -                Button("Comprobar conexión y DDI") { coordinator.prepare() }.disabled(coordinator.busy || pairing.active)
+          -                Button("Activar JIT") { coordinator.enable() }.disabled(coordinator.busy || pairing.active)
+          -                Button("Restablecer DDI") { coordinator.resetDDI() }.disabled(coordinator.busy || pairing.active)
+          +                Button("Comprobar conexión y DDI") { coordinator.prepare() }.disabled(coordinator.busy || pairing.active || coordinator.requiresRestart)
+          +                Button("Activar JIT") { coordinator.enable() }.disabled(coordinator.busy || pairing.active || coordinator.requiresRestart)
+          +                Button("Restablecer DDI") { coordinator.resetDDI() }.disabled(coordinator.busy || pairing.active || coordinator.requiresRestart)
+                           if coordinator.busy { ProgressView() }
+                           Text(coordinator.status).font(.footnote)
+                       }
+          --- a/src/MeloNX/MeloNX/Common/JIT/OnDevicePairing.swift
+          +++ b/src/MeloNX/MeloNX/Common/JIT/OnDevicePairing.swift
+          @@ -2,6 +2,7 @@
+           import BackgroundTasks
+           import dnssd
+           import Foundation
+          +import Combine
+           import SwiftUI
+           import UIKit
+           import UserNotifications
+          @@ -99,7 +100,9 @@
+                       }
+                   }
+           
+          +        let sessionAddress = UInt(bitPattern: session)
+                   DispatchQueue.global(qos: .userInitiated).async {
+          +            guard let session = OpaquePointer(bitPattern: sessionAddress) else { return }
+                       var bytes: UnsafeMutablePointer<UInt8>?
+                       var length = 0
+                       var device: UnsafeMutablePointer<CChar>?
+          @@ -124,7 +127,10 @@
+                   guard let session else { return }
+                   husk_rppairing_cancel(session)
+                   stopAdvertising()
+          +        deadline?.invalidate()
+          +        deadline = nil
+                   phase = reason.map(Phase.failed) ?? .idle
+          +        endBackground(success: false)
+                   log(reason == nil ? "cancelled" : "stopped")
+               }
+           
+          @@ -148,11 +154,13 @@
+               }
+           
+               private func finished(status: Int32, data: Data?, device: String?, message: String?) {
+          +        let wasActive = active
+                   if let session { husk_rppairing_free(session) }
+                   session = nil
+                   stopAdvertising()
+                   deadline?.invalidate()
+                   deadline = nil
+          +        guard wasActive else { endBackground(success: false); return }
+                   switch status {
+                   case 0:
+                       do {
+          @@ -213,7 +221,12 @@
+                       advertisingFailed(error)
+                       return false
+                   }
+          -        DNSServiceSetDispatchQueue(ref, .main)
+          +        let queueError = DNSServiceSetDispatchQueue(ref, .main)
+          +        guard queueError == DNSServiceErrorType(kDNSServiceErr_NoError) else {
+          +            DNSServiceRefDeallocate(ref)
+          +            advertisingFailed(queueError)
+          +            return false
+          +        }
+                   registration = ref
+                   return true
+               }
+          @@ -236,7 +249,8 @@
+               /// The permitted "<bundle id>.pairing.*" identifier from Info.plist, made concrete.
+               private var taskIdentifier: String? {
+                   let permitted = Bundle.main.object(forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers") as? [String] ?? []
+          -        guard let wildcard = permitted.first(where: { $0.hasSuffix(".pairing.*") }) else { return nil }
+          +        guard let bundleID = Bundle.main.bundleIdentifier,
+          +              let wildcard = permitted.first(where: { $0 == bundleID + ".pairing.*" }) else { return nil }
+                   return String(wildcard.dropLast()) + "session"
+               }
+           
+          @@ -288,7 +302,6 @@
+                   }
+                   task.expirationHandler = {
+                       DispatchQueue.main.async {
+          -                OnDevicePairing.shared.continued = nil
+                           OnDevicePairing.shared.cancel(reason: "iOS stopped the pairing in the background. Try again.")
+                       }
+                   }
+          --- a/src/MeloNX/MeloNX/Common/JIT/MeloNXBuiltInJIT.swift
+          +++ b/src/MeloNX/MeloNX/Common/JIT/MeloNXBuiltInJIT.swift
+          @@ -116,6 +116,7 @@
+               private let `extension`: AnyObject   // the NSExtension, kept alive for the request
+               private let operation: String
+               private var completion: ((Result<MeloNXJITRequest.Response, Error>) -> Void)?
+          +    private var watchdog: Task<Void, Never>?
+           
+               init(extension found: AnyObject, operation: String,
+                    completion: @escaping (Result<MeloNXJITRequest.Response, Error>) -> Void) {
+          @@ -143,11 +144,15 @@
+                           self?.end(.failure(Self.error(6, "MeloNX's JIT helper stopped unexpectedly. Try again.")))
+                       } }
+                   }
+          +        watchdog = Task { @MainActor [weak self] in
+          +            do { try await Task.sleep(nanoseconds: 300_000_000_000) } catch { return }
+          +            self?.end(.failure(Self.error(9, "El helper no respondió. Cerrá completamente MeloNX antes de volver a intentar.")))
+          +        }
+                   let item = NSExtensionItem()
+                   item.userInfo = [MeloNXJITRequest.itemKey: data]
+                   shim.beginExtensionRequest(withInputItems: [item]) { [weak self] uuid in
+                       DispatchQueue.main.async { MainActor.assumeIsolated {
+          -                guard let self else { return }
+          +                guard let self, self.completion != nil else { return }
+                           guard let uuid else {
+                               self.end(.failure(Self.error(7, "MeloNX's JIT helper did not start. Reinstall MeloNX, and "
+                                                             + "keep its app extensions if your sideloader asks.")))
+          @@ -173,6 +178,8 @@
+               private func end(_ result: Result<MeloNXJITRequest.Response, Error>) {
+                   guard let completion else { return }   // the first result counts
+                   self.completion = nil
+          +        watchdog?.cancel()
+          +        watchdog = nil
+                   if case .failure(let error) = result {
+                       MeloNXJITLog.log("jit-helper", "\(operation): \(error.localizedDescription)")
+                   }
+          --- a/src/MeloNX/MeloNX/Core/RyujinxController.swift
+          +++ b/src/MeloNX/MeloNX/Core/RyujinxController.swift
+          @@ -159,6 +159,13 @@
+               
+               private static var hasScript: Bool = false
+               static var hasPreparedJITMemory: Bool { hasScript }
+          +    private static var integratedJITInProgress = false
+          +    private static var integratedJITFailed = false
+          +    static func beginIntegratedJIT() { integratedJITInProgress = true }
+          +    static func finishIntegratedJIT(success: Bool) {
+          +        integratedJITFailed = !success
+          +        integratedJITInProgress = false
+          +    }
+               private var controllerManager: ControllerManager = .shared
+               private var emulationThreadActive = false
+               
+          @@ -419,7 +426,8 @@
+                   }
+               }
+               
+          -    static func attemptToMapDualMapping() -> Bool {
+          +    static func attemptToMapDualMapping(fromIntegratedHelper: Bool = false) -> Bool {
+          +        if integratedJITFailed || (integratedJITInProgress && !fromIntegratedHelper) { return false }
+                   if hasScript { return true }
+                   if #available(iOS 26.0, *), ProcessInfo.processInfo.hasTXM && !checkDebugged() { return false }
+                   
+          --- a/src/MeloNX/MeloNX/Core/MeloNX-Bridging-Header.h
+          +++ b/src/MeloNX/MeloNX/Core/MeloNX-Bridging-Header.h
+          @@ -3,8 +3,8 @@
+           //
+           
+           
+          -#ifndef MeloNX-BridgingHeader_h
+          -#define MeloNX-BridgingHeader_h
+          +#ifndef MELONX_BRIDGING_HEADER_H
+          +#define MELONX_BRIDGING_HEADER_H
+           
+           #include <SDL3/SDL.h>
+           #include <SDL3/SDL_main.h>
+          --- a/distribution/ios/a19/MeloNXJITHelper/MeloNXJITHelper.swift
+          +++ b/distribution/ios/a19/MeloNXJITHelper/MeloNXJITHelper.swift
+          @@ -33,7 +33,7 @@
+                           throw NSError(domain: "MeloNXJITHelper", code: 1,
+                                         userInfo: [NSLocalizedDescriptionKey: "The pairing file was not provided."])
+                       }
+          -            let pairingURL = root.appendingPathComponent("pairingFile-\(UUID().uuidString).plist")
+          +            let pairingURL = manager.temporaryDirectory.appendingPathComponent("pairingFile-\(UUID().uuidString).plist")
+                       try pairingData.write(to: pairingURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                       defer { try? manager.removeItem(at: pairingURL) }
+           
+          --- a/distribution/ios/a19/validate-bundle.py
+          +++ b/distribution/ios/a19/validate-bundle.py
+          @@ -1,5 +1,5 @@
+           """Static packaging checks; does not prove iOS launch or JIT success."""
+          -import sys, plistlib
+          +import sys, plistlib, subprocess
+           from pathlib import Path
+           app=Path(sys.argv[1]); ext=app/'PlugIns/MeloNXJITHelper.appex'; fw=app/'Frameworks/StikJIT.framework'
+           read=lambda p: plistlib.loads(p.read_bytes())
+          @@ -10,6 +10,14 @@
+           assert e['NSExtension']['NSExtensionPrincipalClass']=='MeloNXJITHelperHandler'
+           assert a.get('NSBonjourServices') and a.get('BGTaskSchedulerPermittedIdentifiers')
+           for directory, info in [(app,a),(ext,e),(fw,f)]:
+          -    assert (directory/info['CFBundleExecutable']).stat().st_size>0
+          +    executable=directory/info['CFBundleExecutable']
+          +    assert executable.stat().st_size>0
+          +    subprocess.run(['lipo','-verify_arch','arm64',str(executable)], check=True)
+           assert (fw/'universal.js').stat().st_size>0
+          +helper=ext/e['CFBundleExecutable']
+          +links=subprocess.check_output(['otool','-L',str(helper)],text=True)
+          +assert '@rpath/StikJIT.framework/StikJIT' in links, 'helper missing StikJIT link'
+          +load=subprocess.check_output(['otool','-l',str(helper)],text=True)
+          +assert '@executable_path/../../Frameworks' in load, 'helper missing framework runpath'
+          +assert a['CFBundleIdentifier']+'.pairing.*' in a['BGTaskSchedulerPermittedIdentifiers'], 'pairing task identifier mismatch before signing'
+           print('Static bundle checks passed; signing and device tests still required.')
+          A19_REVIEW_PATCH
+          git apply --check "$RUNNER_TEMP/a19-review.patch"
+          git apply "$RUNNER_TEMP/a19-review.patch"
           chmod +x distribution/ios/a19/*.sh distribution/ios/build.sh
       - uses: actions/setup-dotnet@v4
         with:
@@ -42,8 +399,71 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Preflight reviewed sources and toolchain fingerprint
+        id: preflight
+        run: |
+          for f in src/MeloNX/MeloNX/Common/JIT/{MeloNXJITCoordinator,OnDevicePairing,MeloNXBuiltInJIT}.swift src/MeloNX/MeloNX/Core/RyujinxController.swift distribution/ios/a19/MeloNXJITHelper/MeloNXJITHelper.swift; do
+            xcrun swiftc -frontend -parse "$f"
+          done
+          python3 -m py_compile distribution/ios/a19/validate-bundle.py
+          bash -n distribution/ios/a19/build-dependencies.sh
+          bash -n distribution/ios/a19/package.sh
+          echo "fingerprint=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; dotnet --version; rustc --version; uname -m; } | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Restore NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-a19-${{ runner.os }}-${{ hashFiles('source/global.json', 'source/**/*.csproj', 'source/**/Directory.Packages.props', 'source/nuget.config') }}
+      - name: Restore compiled native helpers
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            source/distribution/ios/a19/build/libhusk_rppairing.a
+            source/distribution/ios/a19/build/LICENSES-rppairing-crates.txt
+            source/distribution/ios/a19/build/StikJIT.framework
+            source/distribution/ios/a19/build/helper/Build/Products/Release-iphoneos/MeloNXJITHelper.appex
+          key: native-a19-v1-${{ steps.preflight.outputs.fingerprint }}-${{ hashFiles('source/distribution/ios/a19/vendor/**', 'source/distribution/ios/a19/MeloNXJITHelper/**', 'source/distribution/ios/a19/project.yml', 'source/distribution/ios/a19/build-dependencies.sh') }}
       - name: Compile native pairing and StikJIT helper
+        if: steps.native-cache.outputs.cache-hit != 'true'
         run: distribution/ios/a19/build-dependencies.sh
+      - name: Validate native products
+        run: |
+          A=distribution/ios/a19/build
+          test -s "$A/LICENSES-rppairing-crates.txt"
+          test -s "$A/StikJIT.framework/universal.js"
+          lipo -verify_arch arm64 "$A/libhusk_rppairing.a"
+          lipo -verify_arch arm64 "$A/StikJIT.framework/StikJIT"
+          lipo -verify_arch arm64 "$A/helper/Build/Products/Release-iphoneos/MeloNXJITHelper.appex/MeloNXJITHelper"
+      - name: Save compiled native helpers before host build
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            source/distribution/ios/a19/build/libhusk_rppairing.a
+            source/distribution/ios/a19/build/LICENSES-rppairing-crates.txt
+            source/distribution/ios/a19/build/StikJIT.framework
+            source/distribution/ios/a19/build/helper/Build/Products/Release-iphoneos/MeloNXJITHelper.appex
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
+      - name: Restore compiled Ryujinx core
+        id: core-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: source/src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
+          key: core-a19-v1-${{ steps.preflight.outputs.fingerprint }}-f925129209afd55927a0201d82285b8fa4b7ba30-${{ hashFiles('source/distribution/ios/build.sh') }}
+      - name: Compile Ryujinx core if needed
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: distribution/ios/build.sh
+      - name: Validate core and mark ready for Xcode
+        run: |
+          lipo -verify_arch arm64 src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
+          touch .ci-core-cache-hit
+      - name: Save compiled core before host build
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: source/src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
+          key: ${{ steps.core-cache.outputs.cache-primary-key }}
       - name: Archive MeloNX
         run: |
           xcodebuild archive -project src/MeloNX/MeloNX.xcodeproj -scheme MeloNX \

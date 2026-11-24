@@ -38,6 +38,12 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/s2arm-port"
           cd "$RUNNER_TEMP/s2arm-port"
+          # The runner can have newer SDKs preinstalled. Pin CLI and MSBuild resolution.
+          printf '%s\n' '{"sdk":{"version":"10.0.402","rollForward":"disable","allowPrerelease":false}}' > global.json
+          export PATH="$DOTNET_ROOT:$PATH"
+          hash -r
+          "$DOTNET_ROOT/dotnet" --list-sdks
+          "$DOTNET_ROOT/dotnet" --info
           cat > Formats.cs <<'S2ARM_SOURCE_EOF'
           // Minimal iOS port of the S2Arm v0.6.10 image and program-pack formats.
           // Derived from upstream ios/embed.py, ios/macho_dylib.py, pack/img.py.
@@ -405,6 +411,7 @@ jobs:
           T=$(mktemp -d)
           trap 'rm -rf "$T"' EXIT
           cd "$T"
+          cp "$PORT/global.json" .
           dotnet new console -f net10.0 --no-restore -o test
           cp "$PORT/Formats.cs" test/
           cat > test/Program.cs <<'CS'
@@ -452,6 +459,8 @@ jobs:
           PORT="$(cd "$(dirname "$0")" && pwd)"
           T=$(mktemp -d)
           trap 'rm -rf "$T"' EXIT
+          cp "$PORT/global.json" "$T/global.json"
+          cd "$T"
           dotnet new console -f net10.0 --no-restore -o "$T/host"
           rm "$T/host/Program.cs"
           cp "$PORT"/*.cs "$T/host/"
@@ -562,10 +571,18 @@ jobs:
           XCODE_VERSION="$(xcodebuild -version)"
           printf '%s\n' "$XCODE_VERSION"
           [[ "$XCODE_VERSION" == "Xcode 27.1"* ]]
-          test "$(dotnet --version)" = 10.0.402
+          export PATH="$DOTNET_ROOT:$PATH"
+          hash -r
+          command -v dotnet
+          dotnet --list-sdks
+          dotnet --info
+          SELECTED_SDK="$(dotnet --version)"
+          echo "Selected SDK: $SELECTED_SDK"
+          [[ "$SELECTED_SDK" == 10.0.402 ]] || { echo "::error::Expected 10.0.402, selected $SELECTED_SDK"; exit 1; }
           # Official .NET 10 release supporting Xcode 27.1, no validation bypass.
           dotnet workload install ios --version 10.0.402.1
           dotnet workload --info
+          ls -la "$DOTNET_ROOT/packs/Microsoft.iOS.Sdk.net10.0_27.1/"
           test -d "$DOTNET_ROOT/packs/Microsoft.iOS.Sdk.net10.0_27.1/27.1.10018"
           bash build.sh "$GITHUB_WORKSPACE/upstream"
       - uses: actions/upload-artifact@v4

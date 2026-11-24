@@ -9,10 +9,22 @@ jobs:
   build:
     runs-on: ubuntu-24.04-arm
     steps:
+      - name: Prepare authentication patch
+        run: |
+          cat > auth-patch.py <<'PY'
+          from pathlib import Path
+          for name, changes in [["SideInstaller/rust-core/vendor/isideload/src/auth/apple_account.rs",[["    auth_as_mac: bool,\n}","    auth_as_mac: bool,\n    web_2fa: bool,\n    code_accepted: bool,\n}"],["            auth_as_mac: false,\n","            auth_as_mac: false,\n            web_2fa: false,\n            code_accepted: false,\n"],["        Ok(Self::state_after_proof(status))","        self.web_2fa = matches!(status.get(\"au\"), Some(plist::Value::String(s)) if s == \"secondaryAuth\");\n        let next = if self.web_2fa { LoginState::NeedsDevice2FA } else { Self::state_after_proof(status) };\n        if self.code_accepted && matches!(&next, LoginState::NeedsDevice2FA | LoginState::NeedsDevice2FAVerification | LoginState::NeedsSMS2FA(_) | LoginState::NeedsSMS2FAVerification(_) | LoginState::NeedsUnknown2FA) {\n            bail!(\"Apple accepted the verification code but requested another challenge; stopped without retry\");\n        }\n        Ok(next)"],["        let submit_code_url = self.grandslam_client.get_url(\"validateCode\")?;","        if self.web_2fa {\n            let headers = self.build_2fa_headers(&anisette_data).await?;\n            let body = serde_json::json!({\"securityCode\": {\"code\": code}});\n            let (status, text) = self.send_auth(reqwest::Method::POST, \"https://gsa.apple.com/auth/verify/trusteddevice/securitycode\", true, headers, Some(body.to_string())).await.context(\"Web trusted-device verification failed\")?;\n            if !status.is_success() {\n                if let Some(error) = Self::parse_sms_service_error(&text) {\n                    bail!(\"Web trusted-device verification rejected (HTTP {}, Apple {}); stopped without retry\", status.as_u16(), error.code);\n                }\n                bail!(\"Web trusted-device verification failed (HTTP {}); stopped without retry\", status.as_u16());\n            }\n            self.code_accepted = true;\n            info!(\"Apple accepted trusted-device code via web verification\");\n            return Ok(LoginState::NeedsLogin);\n        }\n        let submit_code_url = self.grandslam_client.get_url(\"validateCode\")?;"],["                        warn!(\"{} - {}\", code, message);\n                        self.last_error = format!(\"{} - {}\", code, message).into();\n\n                        return Ok(LoginState::NeedsDevice2FAVerification);","                        bail!(\"Apple rejected trusted-device code ({code}); stopped without retry\");"],["        debug!(\"Trusted device 2FA completed, need to login again\");","        self.code_accepted = true;\n        info!(\"Apple accepted trusted-device code via validateCode\");"],["                warn!(\"{} - {}\", error.title, error.message);\n                self.last_error = format!(\"{} - {}\", error.title, error.message).into();\n                return Ok(LoginState::NeedsSMS2FAVerification(id));","                bail!(\"Apple rejected phone verification code ({}); stopped without retry\", error.code);"],["        debug!(\"Phone 2FA completed, need to login again\");","        self.code_accepted = true;\n        info!(\"Apple accepted phone verification code\");"]]],["minis/src/account.rs",[["fn stops_sign_in(error: &str) -> Option<&'static str> {","fn stops_sign_in(error: &str) -> Option<&'static str> {\n    if error.contains(\"stopped without retry\") { return Some(\"Apple verification stopped; no further codes requested.\"); }"]]]]:
+              p = Path('/tmp/siboot') / name
+              s = p.read_text()
+              for old, new in changes:
+                  assert s.count(old) == 1, old
+                  s = s.replace(old, new, 1)
+              p.write_text(s)
+          PY
       - name: Build in Alpine ARM64
         run: |
           docker run --rm -v "$PWD:/out" alpine:edge sh -euxc '
-            apk add git build-base cmake perl clang linux-headers rustup pkgconf
+            apk add git build-base cmake perl clang linux-headers rustup pkgconf python3
             rustup-init -y --profile minimal --default-toolchain stable
             export PATH="$HOME/.cargo/bin:$PATH"
             git clone https://github.com/FrizzleM/siboot.git /tmp/siboot
@@ -21,6 +33,7 @@ jobs:
             git submodule update --init --recursive
             git -C SideInstaller fetch origin 823b7acced547a7f90a69eaf16d8a1aa9c50fb9c
             git -C SideInstaller checkout 823b7acced547a7f90a69eaf16d8a1aa9c50fb9c
+            python3 /out/auth-patch.py
             cd minis
             rustup target add aarch64-unknown-linux-musl
             cargo build --release --target aarch64-unknown-linux-musl
@@ -30,5 +43,5 @@ jobs:
           '
       - uses: actions/upload-artifact@v4
         with:
-          name: siboot-aarch64
+          name: siboot-auth-v2
           path: siboot-aarch64

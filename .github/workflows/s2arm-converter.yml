@@ -1,16 +1,26 @@
-name: S2Arm Converter 0.1 (experimental)
+name: S2Arm Converter 0.2 (audited experimental)
 on:
   workflow_dispatch:
   push:
     paths:
       - '.github/workflows/s2arm-converter.yml'
+concurrency:
+  group: s2arm-converter-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
+  statuses: write
 jobs:
   build:
     runs-on: xcode-27
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
+      - name: Publish run link
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=pending -f context=s2arm-converter -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" -f description='Converter build started'
       - uses: actions/checkout@v4
         with:
           repository: jhaizhou-ops/S2Arm
@@ -19,6 +29,9 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.401'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Prepare converter source
         shell: bash
         run: |
@@ -144,6 +157,14 @@ jobs:
               static void Need(bool ok,string message){if(!ok)throw new InvalidDataException(message);}
               static void Tar(TarWriter t,string name,Stream data){var e=new UstarTarEntry(TarEntryType.RegularFile,name){DataStream=data,ModificationTime=DateTimeOffset.UnixEpoch};t.WriteEntry(e);}
               static void TarBytes(TarWriter t,string name,byte[] bytes){using var m=new MemoryStream(bytes,false);Tar(t,name,m);}
+              internal static int ModuleRank(string m)=>m=="main"?0:m=="sdk"?11:m.Length==7&&m.StartsWith("subsdk",StringComparison.Ordinal)&&m[6]>='0'&&m[6]<='9'?1+m[6]-'0':-1;
+              internal static void WritePackage(string outFile,string gid,string title,string version,string imageName,string sha,string pid,long size,List<(string name,string path)> entries,bool hasIcon){
+                  var index=Encoding.UTF8.GetBytes($"game.img\t{size}\t{pid}\n");string indexSha=ConverterFormats.Sha(index);var manifest=Json(w=>{w.WriteNumber("version",3);w.WriteString("format","img");w.WriteString("imgFile","game.img");w.WriteNumber("files",1);w.WriteNumber("total",size);w.WriteString("index_sha256",indexSha);});
+                  void Common(Utf8JsonWriter w){w.WriteString("title_id",gid);w.WriteString("name",title);w.WriteString("display_version",version);w.WriteNumber("host_abi",GeneratedVersion.HostAbi);w.WriteString("chain",GeneratedVersion.Chain);w.WriteString("rewriter_id",GeneratedVersion.Rewriter);w.WriteString("image",imageName);w.WriteString("image_sha256",sha);}
+                  var cat=Json(w=>{w.WriteNumber("schema",1);Common(w);w.WriteNull("team");if(hasIcon)w.WriteString("icon","Games/"+gid+"/icon.jpg");});long total=cat.LongLength+index.LongLength+manifest.LongLength+entries.Sum(e=>new FileInfo(e.path).Length);
+                  var head=Json(w=>{w.WriteString("format","s2arm");w.WriteNumber("schema",1);Common(w);w.WriteString("source_sha256",sha);w.WriteString("pack",indexSha);w.WriteNumber("bytes",total);w.WriteNull("signer");});
+                  using(var file=File.Create(outFile))using(var z=new CompressionStream(file,3)){z.SetParameter(ZstdSharp.Unsafe.ZSTD_cParameter.ZSTD_c_checksumFlag,1);using var tar=new TarWriter(z,TarEntryFormat.Ustar,true);TarBytes(tar,"s2arm.json",head);TarBytes(tar,"program/catalogue.json",cat);foreach(var e in entries){using var stream=File.OpenRead(e.path);Tar(tar,e.name,stream);}TarBytes(tar,"pack/index.tsv",index);TarBytes(tar,"pack/manifest.json",manifest);}
+              }
               internal static string Run(string keys,string game,string docs,string bundle,Action<string> progress){
                   Need(File.Exists(keys)&&File.Exists(game),"No se pudo acceder a los archivos seleccionados.");
                   Need(new[]{".nsp",".xci"}.Contains(Path.GetExtension(game).ToLowerInvariant()),"Seleccioná un NSP o XCI de Switch.");
@@ -156,20 +177,16 @@ jobs:
                       var npdm=Path.Combine(root,"exefs","main.npdm");byte[] np=File.ReadAllBytes(npdm);Need(np.Length>=0x80&&Encoding.ASCII.GetString(np,0,4)=="META"&&(np[0x0c]&1)!=0,"Se requiere un juego ARM64.");
                       int aci=checked((int)BinaryPrimitives.ReadUInt32LittleEndian(np.AsSpan(0x70,4)));Need(aci>=0&&aci<=np.Length-24&&Encoding.ASCII.GetString(np,aci,4)=="ACI0","NPDM inválido.");string gid=BinaryPrimitives.ReadUInt64LittleEndian(np.AsSpan(aci+16,8)).ToString("X16");
                       string rom=Path.Combine(root,"romfs.std");Need(File.Exists(rom),"No se generó RomFS estándar.");var names=ConverterFormats.RomNames(rom);Need(!names.Any(n=>n.EndsWith(".nro",StringComparison.OrdinalIgnoreCase)||n.EndsWith(".nrr",StringComparison.OrdinalIgnoreCase)),"Esta versión mínima no admite módulos NRO/NRR adicionales.");
-                      var mods=new List<string>();foreach(var p in Directory.GetFiles(Path.Combine(root,"exefs")).OrderBy(x=>x,StringComparer.Ordinal)){string m=Path.GetFileName(p);if(m=="rtld"||m.EndsWith(".npdm"))continue;using var f=File.OpenRead(p);Span<byte> magic=stackalloc byte[4];if(f.Read(magic)!=4||!magic.SequenceEqual("NSO0"u8))continue;mods.Add(m);}
-                      Need(mods.Contains("main"),"Falta el NSO principal.");mods=mods.OrderBy(m=>m=="main"?0:1).ThenBy(m=>m,StringComparer.Ordinal).ToList();
+                      var mods=new List<string>();foreach(var p in Directory.GetFiles(Path.Combine(root,"exefs")).OrderBy(x=>x,StringComparer.Ordinal)){string m=Path.GetFileName(p);if(ModuleRank(m)<0)continue;using var f=File.OpenRead(p);Span<byte> magic=stackalloc byte[4];if(f.Read(magic)!=4||!magic.SequenceEqual("NSO0"u8))continue;mods.Add(m);}
+                      Need(mods.Contains("main"),"Falta el NSO principal.");mods=mods.OrderBy(ModuleRank).ToList();
                       string fix=null;using(var main=File.OpenRead(Path.Combine(root,"exefs","main"))){main.Position=0x40;var b=new byte[8];main.ReadExactly(b);string candidate=Path.Combine(bundle,"fix",Convert.ToHexString(b).ToLowerInvariant()+".tsv");if(File.Exists(candidate))fix=candidate;}
-                      foreach(string m in mods){progress("Convirtiendo código: "+m);rc=Rewrite(Path.Combine(root,"exefs",m),rw,m,fix,Path.Combine(work,"rewrite.log"));if(rc!=0){string p=Path.Combine(work,"rewrite.log");if(File.Exists(p))logger.WriteLine(File.ReadAllText(p));throw new InvalidDataException($"Reescritura de {m} fallida ({rc}). Esta prueba no admite huecos de traducción.");}}
+                      foreach(string m in mods){progress("Convirtiendo código: "+m);rc=Rewrite(Path.Combine(root,"exefs",m),rw,m,fix,Path.Combine(work,"rewrite.log"));if(rc==3&&File.Exists(Path.Combine(rw,m+".patched.bin"))){logger.WriteLine($"Advertencia: {m} tiene huecos de traducción; el juego podría fallar.");}else if(rc!=0){string p=Path.Combine(work,"rewrite.log");if(File.Exists(p))logger.WriteLine(File.ReadAllText(p));throw new InvalidDataException($"Reescritura de {m} fallida ({rc}).");}}
                       var meta=new Dictionary<string,string>();foreach(var line in File.ReadLines(Path.Combine(root,"unpack.tsv"))){int i=line.IndexOf('\t');if(i>0)meta.TryAdd(line[..i],line[(i+1)..]);}string title=meta.GetValueOrDefault("name",gid),version=meta.GetValueOrDefault("display_version","");
                       progress("Generando programa S2Arm…");string imageName=$"S2AImages-{gid}.dylib",dylib=Path.Combine(work,imageName);ConverterFormats.Dylib(rw,dylib,mods);string sha=ConverterFormats.Sha(dylib);
                       var entries=new List<(string name,string path)>{("program/"+imageName,dylib),("program/Games/"+gid+"/main.npdm",npdm)};foreach(var m in mods)foreach(var suffix in new[]{".fixups.tsv",".gates.tsv"}){var p=Path.Combine(rw,m+suffix);Need(File.Exists(p),"Falta tabla del rewriter: "+m+suffix);entries.Add(("program/Games/"+gid+"/"+m+suffix,p));}
                       string icon=Path.Combine(root,"icon.jpg");if(File.Exists(icon))entries.Add(("program/Games/"+gid+"/icon.jpg",icon));
-                      progress("Preparando imagen de recursos…");var extras=new List<(string rel,string path)>{("exefs/main.npdm",npdm)};var nacp=Path.Combine(root,"ctl","control.nacp");if(File.Exists(nacp))extras.Add(("ctl/control.nacp",nacp));string img=Path.Combine(outdir,gid+".img");string pid=ConverterFormats.Image(rom,img,gid,extras,names);long size=new FileInfo(img).Length;
-                      var index=Encoding.UTF8.GetBytes($"game.img\t{size}\t{pid}\n");string indexSha=ConverterFormats.Sha(index);var manifest=Json(w=>{w.WriteNumber("version",3);w.WriteString("format","img");w.WriteString("imgFile","game.img");w.WriteNumber("files",1);w.WriteNumber("total",size);w.WriteString("index_sha256",indexSha);});
-                      void Common(Utf8JsonWriter w){w.WriteString("title_id",gid);w.WriteString("name",title);w.WriteString("display_version",version);w.WriteNumber("host_abi",GeneratedVersion.HostAbi);w.WriteString("chain",GeneratedVersion.Chain);w.WriteString("rewriter_id",GeneratedVersion.Rewriter);w.WriteString("image",imageName);w.WriteString("image_sha256",sha);}
-                      var cat=Json(w=>{w.WriteNumber("schema",1);Common(w);w.WriteNull("team");if(File.Exists(icon))w.WriteString("icon","Games/"+gid+"/icon.jpg");});long total=cat.LongLength+index.LongLength+manifest.LongLength+entries.Sum(e=>new FileInfo(e.path).Length);
-                      var head=Json(w=>{w.WriteString("format","s2arm");w.WriteNumber("schema",1);Common(w);w.WriteString("source_sha256",sha);w.WriteString("pack",indexSha);w.WriteNumber("bytes",total);w.WriteNull("signer");});
-                      progress("Comprimiendo paquete…");using(var file=File.Create(Path.Combine(outdir,gid+".s2arm")))using(var z=new CompressionStream(file,3)){z.SetParameter(ZstdSharp.Unsafe.ZSTD_cParameter.ZSTD_c_checksumFlag,1);using var tar=new TarWriter(z,TarEntryFormat.Ustar,true);TarBytes(tar,"s2arm.json",head);TarBytes(tar,"program/catalogue.json",cat);foreach(var e in entries){using var stream=File.OpenRead(e.path);Tar(tar,e.name,stream);}TarBytes(tar,"pack/index.tsv",index);TarBytes(tar,"pack/manifest.json",manifest);}
+                      progress("Preparando imagen de recursos…");var extras=new List<(string rel,string path)>{("exefs/main.npdm",npdm)};var nacp=Path.Combine(root,"ctl","control.nacp");if(File.Exists(nacp))extras.Add(("ctl/control.nacp",nacp));string sys=Path.Combine(bundle,"systemdata");Need(Directory.Exists(sys),"Faltan datos de sistema en el conversor.");foreach(var p in Directory.EnumerateFiles(sys,"*",SearchOption.AllDirectories))extras.Add(("systemdata/"+Path.GetRelativePath(sys,p).Replace('\\','/'),p));string img=Path.Combine(outdir,gid+".img");string pid=ConverterFormats.Image(rom,img,gid,extras,names);long size=new FileInfo(img).Length;
+                      progress("Comprimiendo paquete…");WritePackage(Path.Combine(outdir,gid+".s2arm"),gid,title,version,imageName,sha,pid,size,entries,File.Exists(icon));
                       string dest=Path.Combine(docs,"Converted",gid+"-"+DateTime.UtcNow.ToString("yyyyMMdd-HHmmss"));Directory.CreateDirectory(Path.GetDirectoryName(dest)!);Directory.Move(outdir,dest);return dest;
                   } finally {Console.SetOut(oldOut);Console.SetError(oldErr);try{Directory.Delete(work,true);}catch{}}
               }
@@ -214,7 +231,7 @@ jobs:
               <TargetFramework>net10.0-ios</TargetFramework><RuntimeIdentifier>ios-arm64</RuntimeIdentifier>
               <OutputType>Exe</OutputType><SupportedOSPlatformVersion>18.0</SupportedOSPlatformVersion>
               <ApplicationId>com.local.s2arm.converter.a19</ApplicationId><ApplicationTitle>S2Arm Converter</ApplicationTitle>
-              <ApplicationDisplayVersion>0.1</ApplicationDisplayVersion><ApplicationVersion>1</ApplicationVersion>
+              <ApplicationDisplayVersion>0.2</ApplicationDisplayVersion><ApplicationVersion>2</ApplicationVersion>
               <EnableCodeSigning>false</EnableCodeSigning><EnableDefaultCodesignEntitlements>false</EnableDefaultCodesignEntitlements>
               <AllowUnsafeBlocks>true</AllowUnsafeBlocks><InvariantGlobalization>true</InvariantGlobalization>
               <ImplicitUsings>enable</ImplicitUsings>
@@ -224,6 +241,7 @@ jobs:
               <PackageReference Include="ZstdSharp.Port" Version="0.8.8"/>
               <NativeReference Include="libconverter.a" Kind="Static" ForceLoad="true"/>
               <BundleResource Include="fix/*.tsv" LogicalName="fix/%(Filename)%(Extension)"/>
+              <BundleResource Include="systemdata/**/*" LogicalName="systemdata/%(RecursiveDir)%(Filename)%(Extension)"/>
             </ItemGroup>
           </Project>
           S2ARM_SOURCE_EOF
@@ -234,8 +252,8 @@ jobs:
           <key>CFBundleDisplayName</key><string>S2Arm Converter</string>
           <key>CFBundleName</key><string>S2ArmConverter</string>
           <key>CFBundleIdentifier</key><string>com.local.s2arm.converter.a19</string>
-          <key>CFBundleVersion</key><string>1</string>
-          <key>CFBundleShortVersionString</key><string>0.1</string>
+          <key>CFBundleVersion</key><string>2</string>
+          <key>CFBundleShortVersionString</key><string>0.2</string>
           <key>LSRequiresIPhoneOS</key><true/>
           <key>UIDeviceFamily</key><array><integer>1</integer></array>
           <key>UIFileSharingEnabled</key><true/>
@@ -292,32 +310,71 @@ jobs:
           config.write(pathlib.Path(sys.argv[1])/"nuget.config", encoding="utf-8", xml_declaration=True)
           PY
           python3 - "$PORT" <<'PY'
-          import pathlib,re,sys,subprocess,json
+          import pathlib,re,sys,subprocess,json,hashlib
           p=pathlib.Path(sys.argv[1]); f=p/'Program.cs'; s=f.read_text()
           s,n=re.subn(r'static\s+int\s+Main\s*\(\s*string\[\]\s+a\s*\)', 'internal static int ConvertMain(string[] a)',s)
           assert n==1,'Upstream entry point changed'
           s=re.sub(r'Console\.OutputEncoding\s*=\s*[^;]+;', '',s)
           f.write_text(s)
+          # On iOS keep no more than 2 readers / four 4 MiB buffers in the RomFS pipeline.
+          rf=p/"RomfsExtraction.cs"; rs=rf.read_text()
+          assert rs.count("const long ImageChunk = 8L << 20;")==1
+          rs=rs.replace("const long ImageChunk = 8L << 20;","const long ImageChunk = 4L << 20;")
+          assert rs.count("parallelism <= 0 ? Environment.ProcessorCount : parallelism")==2
+          rs=rs.replace("parallelism <= 0 ? Environment.ProcessorCount : parallelism","parallelism <= 0 ? Math.Min(2, Environment.ProcessorCount) : Math.Min(2, parallelism)")
+          rf.write_text(rs)
           abi=pathlib.Path('runtime/include/s2a_host_abi.h').read_text()
           chain=pathlib.Path('graphics/nvn/gfx/nvn/dmsh_chain.h').read_text()
           a=re.search(r'#define\s+S2A_HOST_ABI\s+(\d+)',abi).group(1)
           c=re.search(r'#define\s+DMSH_CHAIN\s+"([^"]+)"',chain).group(1)
-          r=subprocess.check_output([sys.executable,'pack/rewriter.py','source'],text=True).strip()
-          assert r and '\n' not in r
+          raw=subprocess.check_output([sys.executable,'pack/rewriter.py','source'],text=True)
+          assert re.fullmatch(r'[0-9a-f]{64}',raw.strip()), 'Unexpected upstream source fingerprint'
+          r=hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
+          # Match pack/jobs/rewrite_refresh.py::rewriter_id, including stdout newline.
           (p/'GeneratedVersion.cs').write_text(f'internal static class GeneratedVersion {{ internal const int HostAbi={a}; internal const string Chain={json.dumps(c)}, Rewriter={json.dumps(r)}; }}\n')
           PY
           mkdir -p "$PORT/fix"
           find runtime/fix -maxdepth 1 -name '*.tsv' -exec cp {} "$PORT/fix/" \;
+          # Test the actual managed code and vendored libraries on macOS before packaging iOS.
+          bash "$PORT/test-full.sh" "$UPSTREAM"
+          # Generate exactly the upstream open replacement system data (no private firmware).
+          cd "$UPSTREAM"
+          mkdir -p "$PORT/systemdata"
+          FONTENV="$RUNNER_TEMP/s2arm-fontenv"
+          python3 -m venv "$FONTENV"
+          "$FONTENV/bin/python" -m pip install -r pack/fonts/requirements.txt
+          "$FONTENV/bin/python" pack/fonts/make_open_fonts.py "$PORT/systemdata/fonts"
+          test "$(find "$PORT/systemdata/fonts" -name '*.bfttf' | wc -l | tr -d ' ')" = 7
+          export S2A_PYTHON="$FONTENV/bin/python"
+          if ! bash services/systemdata/make_tzdata.sh --check-sources; then
+            bash services/systemdata/make_tzdata.sh --prepare-sources
+          fi
+          bash services/systemdata/make_tzdata.sh --check-sources
+          bash services/systemdata/make_tzdata.sh "$PORT/systemdata/010000000000080E"
+          for sid in 0100000000000802 0100000000000806 0100000000000823; do
+            python3 pack/sysdata_synth.py "$sid" "$PORT/systemdata/$sid"
+            echo 'Generated by upstream S2Arm sysdata_synth.py' > "$PORT/systemdata/$sid.synth"
+          done
           cd "$PORT"
-          dotnet build Converter.csproj -c Release -r ios-arm64 -p:EnableCodeSigning=false -p:BuildIpa=false
+          dotnet restore Converter.csproj -r ios-arm64 --configfile "$PORT/nuget.config"
+          dotnet build Converter.csproj -c Release -r ios-arm64 --no-restore -p:EnableCodeSigning=false -p:BuildIpa=false
           APP=$(find "$PORT/bin/Release" -type d -name '*.app' -print -quit)
           test -n "$APP"
+          test -f "$APP/Info.plist"
+          test -d "$APP/systemdata/fonts"
+          test "$(find "$APP/systemdata/fonts" -name '*.bfttf' | wc -l | tr -d ' ')" = 7
+          test -f "$APP/systemdata/010000000000080E/binaryList.txt"
+          EXE=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP/Info.plist")
+          xcrun lipo -archs "$APP/$EXE" | grep -w arm64
+          xcrun vtool -show-build "$APP/$EXE" > "$PORT/app-platform.txt"
+          cat "$PORT/app-platform.txt"
+          grep -E "platform[[:space:]]+IOS" "$PORT/app-platform.txt"
           mkdir -p "$PORT/dist/Payload"
           ditto "$APP" "$PORT/dist/Payload/S2ArmConverter.app"
           /usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$PORT/dist/Payload/S2ArmConverter.app/Info.plist"
           cd "$PORT/dist"
-          zip -qry S2ArmConverter-0.1-unsigned.ipa Payload
-          unzip -tq S2ArmConverter-0.1-unsigned.ipa
+          zip -qry S2ArmConverter-0.2-unsigned.ipa Payload
+          unzip -tq S2ArmConverter-0.2-unsigned.ipa
           S2ARM_SOURCE_EOF
           cat > test-formats.sh <<'S2ARM_SOURCE_EOF'
           #!/usr/bin/env bash
@@ -367,6 +424,111 @@ jobs:
           print('Mach-O reference comparison and IMG structure checks passed')
           PY
           S2ARM_SOURCE_EOF
+          cat > test-full.sh <<'S2ARM_SOURCE_EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          UPSTREAM="$(cd "$1" && pwd)"
+          PORT="$(cd "$(dirname "$0")" && pwd)"
+          T=$(mktemp -d)
+          trap 'rm -rf "$T"' EXIT
+          dotnet new console -f net10.0 --no-restore -o "$T/host"
+          rm "$T/host/Program.cs"
+          cp "$PORT"/*.cs "$T/host/"
+          rm "$T/host/App.cs"
+          cp "$PORT/nuget.config" "$T/host/"
+          python3 - "$PORT/Converter.csproj" "$T/host/host.csproj" <<'PY'
+          import sys,xml.etree.ElementTree as ET
+          source=ET.parse(sys.argv[1]); dst=ET.parse(sys.argv[2])
+          props=dst.find("PropertyGroup")
+          ET.SubElement(props,"AllowUnsafeBlocks").text="true"
+          ET.SubElement(props,"InvariantGlobalization").text="true"
+          ET.SubElement(props,"Nullable").text="disable"
+          group=ET.SubElement(dst.getroot(),"ItemGroup")
+          for node in source.findall("./ItemGroup/PackageReference"): group.append(node)
+          dst.write(sys.argv[2])
+          PY
+          cat > "$T/host/HostCheck.cs" <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using System.Collections.Generic;
+          using System.Text;
+          using ZstdSharp;
+          internal static class HostCheck {
+              static int Main(string[] args) {
+                  var root=args[0];
+                  if(P.ConvertMain(new[]{"--test-romfs-publish",Path.Combine(root,"romfs-test")})!=0)throw new Exception("Upstream RomFS test failed");
+                  var mods=new[]{"sdk","subsdk9","main","subsdk0","rtld"}.Where(m=>ConvertJob.ModuleRank(m)>=0).OrderBy(ConvertJob.ModuleRank).ToArray();
+                  if(string.Join(",",mods)!="main,subsdk0,subsdk9,sdk")throw new Exception("Module order wrong");
+                  const string gid="0100123456789000", name="S2AImages-0100123456789000.dylib";
+                  string f=Path.Combine(root,name);
+                  ConverterFormats.Dylib(root,f,mods);
+                  var extra=Path.Combine(root,"main.npdm");
+                  var img=Path.Combine(root,"game.img");
+                  var names=ConverterFormats.RomNames(Path.Combine(root,"rom.std"));
+                  string pid=ConverterFormats.Image(Path.Combine(root,"rom.std"),img,gid,new[]{("exefs/main.npdm",extra)},names);
+                  var entries=new List<(string name,string path)>{("program/"+name,f),("program/Games/"+gid+"/main.npdm",extra)};
+                  foreach(var m in mods)foreach(var suf in new[]{".fixups.tsv",".gates.tsv"})entries.Add(("program/Games/"+gid+"/"+m+suf,Path.Combine(root,m+suf)));
+                  var pkg=Path.Combine(root,"game.s2arm");
+                  ConvertJob.WritePackage(pkg,gid,"Synthetic fixture","1",name,ConverterFormats.Sha(f),pid,new FileInfo(img).Length,entries,false);
+                  using var inp=File.OpenRead(pkg);using var z=new DecompressionStream(inp);using var o=File.Create(Path.Combine(root,"game.tar"));z.CopyTo(o);
+                  return 0;
+              }
+          }
+          CS
+          mkdir "$T/fixture"
+          python3 - "$T/fixture" <<'PY'
+          import pathlib,struct,sys
+          p=pathlib.Path(sys.argv[1])
+          for i,m in enumerate(("main","subsdk0","subsdk9","sdk")):
+              (p/(m+".patched.bin")).write_bytes(bytes((j+i)%256 for j in range(256))*256)
+              (p/(m+".fixups.tsv")).write_text("# TEXT_END 0x3000\n# PATCH_OFF 0xc000\n# KEY_PAGE_OFF 0x4000\n# KEY_PAGE_SIZE 0x4000\n")
+              (p/(m+".gates.tsv")).write_text("")
+          # A standard RomFS with a real file, crossing the 4 MiB buffer.
+          data=bytes(range(256))*20000
+          name=b"sample.bin"; dirs=struct.pack("<6I",0xffffffff,0xffffffff,0xffffffff,0,0xffffffff,0)
+          files=struct.pack("<IIQQII",0,0xffffffff,0,len(data),0xffffffff,len(name))+name+b"\0\0"
+          at=80+len(dirs)+len(files)
+          rom=struct.pack("<10Q",80,0,0,80,len(dirs),0,0,80+len(dirs),len(files),at)+dirs+files+data
+          (p/"rom.std").write_bytes(rom);(p/"rom.reference").write_bytes(rom)
+          (p/"main.npdm").write_bytes(b"fixture NPDM")
+          PY
+          dotnet restore "$T/host/host.csproj" --configfile "$T/host/nuget.config"
+          dotnet run --project "$T/host/host.csproj" -c Release --no-restore -- "$T/fixture"
+          python3 "$UPSTREAM/ios/embed.py" "$T/fixture" "$T/fixture/expected.dylib" main subsdk0 subsdk9 sdk
+          cmp "$T/fixture/S2AImages-0100123456789000.dylib" "$T/fixture/expected.dylib"
+          python3 - "$T/fixture" <<'PY'
+          import hashlib,json,pathlib,struct,sys,tarfile
+          p=pathlib.Path(sys.argv[1])
+          sha=lambda b: hashlib.sha256(b).hexdigest()
+          with tarfile.open(p/"game.tar","r:") as t:
+              items=t.getmembers()
+              assert items[0].name=="s2arm.json" and all(x.isfile() for x in items)
+              read=lambda n:t.extractfile(n).read()
+              head=json.loads(read("s2arm.json")); cat=json.loads(read("program/catalogue.json"))
+              assert head["format"]=="s2arm" and head["schema"]==cat["schema"]==1
+              assert head["title_id"]==cat["title_id"]=="0100123456789000"
+              assert head["rewriter_id"]==cat["rewriter_id"] and len(cat["rewriter_id"])==16
+              assert head["image_sha256"]==cat["image_sha256"]==sha(read("program/"+cat["image"]))
+              assert head["bytes"]==sum(x.size for x in items[1:])
+              ix=read("pack/index.tsv"); mf=json.loads(read("pack/manifest.json"))
+              assert head["pack"]==mf["index_sha256"]==sha(ix)
+              assert (p/"game.s2arm").read_bytes()[:4]==bytes.fromhex("28b52ffd")
+              assert (p/"game.s2arm").read_bytes()[4]&4, "Zstd frame checksum missing"
+              b=(p/"game.img").read_bytes()
+              magic,ver,_,gid,pid,ro,rs,to,ts,total=struct.unpack_from("<8sII16s64s5Q",b)
+              assert magic==b"S2AIMG01" and ver==1 and total==len(b) and gid.decode()==cat["title_id"]
+              assert ix.decode()==f"game.img\t{total}\t{pid.decode()}\n"
+              assert b[ro:ro+rs]==(p/"rom.reference").read_bytes()
+              slots,count=struct.unpack_from("<II",b,to)
+              names={}
+              for i in range(slots):
+                  h,o,n,po,pn=struct.unpack_from("<QQQII",b,to+8+32*i)
+                  if h: names[b[to+8+32*slots+po:to+8+32*slots+po+pn].decode()]=b[o:o+n]
+              assert count==2 and names=={"exefs/main.npdm":b"fixture NPDM","romfs.list":b"sample.bin\n"}
+          print("Full managed package fixture, vendored dependencies, multi-module Mach-O, nonempty RomFS, TAR and zstd checksum passed")
+          PY
+          S2ARM_SOURCE_EOF
       - name: Check binary formats against upstream
         shell: bash
         run: bash "$RUNNER_TEMP/s2arm-port/test-formats.sh" "$GITHUB_WORKSPACE/upstream"
@@ -393,3 +555,12 @@ jobs:
           name: S2ArmConverter-unsigned
           path: ${{ runner.temp }}/s2arm-port/dist/*.ipa
           if-no-files-found: error
+      - name: Report final build status and run link
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+        run: |
+          case "$RESULT" in success) state=success;; failure) state=failure;; *) state=error;; esac
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state="$state" -f context=s2arm-converter -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" -f description="Converter build $RESULT"

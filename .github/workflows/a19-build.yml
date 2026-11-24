@@ -1,0 +1,60 @@
+name: Build MeloNX A19 experimental (unsigned)
+on:
+  push:
+    branches: [a19-experimental]
+    paths: ['a19-overlay.zip', '.github/workflows/a19-build.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: source
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: f925129209afd55927a0201d82285b8fa4b7ba30
+          path: source
+          persist-credentials: false
+      - name: Verify and apply experimental overlay
+        run: |
+          echo 'dfd0e7c1bde9029aec5c2d2347086a15342995da135fec54842587796e04400f  ../a19-overlay.zip' | shasum -a 256 -c -
+          unzip -oq ../a19-overlay.zip
+          chmod +x distribution/ios/a19/*.sh distribution/ios/build.sh
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: source/global.json
+      - name: Select Xcode 27 and tools
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
+          xcodebuild -version
+          command -v xcodegen >/dev/null || brew install xcodegen
+          sudo ln -sf "$(command -v dotnet)" /usr/local/bin/dotnet
+          if ! command -v rustup >/dev/null; then brew install rustup; fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Compile native pairing and StikJIT helper
+        run: distribution/ios/a19/build-dependencies.sh
+      - name: Archive MeloNX
+        run: |
+          xcodebuild archive -project src/MeloNX/MeloNX.xcodeproj -scheme MeloNX \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath build/MeloNX.xcarchive CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
+            SWIFT_OPTIMIZATION_LEVEL=-Onone
+      - name: Assemble and validate unsigned IPA
+        run: distribution/ios/a19/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeloNX-A19-unsigned
+          path: source/build/MeloNX-A19-unsigned.ipa
+          if-no-files-found: error

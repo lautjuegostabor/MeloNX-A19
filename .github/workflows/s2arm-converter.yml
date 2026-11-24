@@ -277,6 +277,20 @@ jobs:
           xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=18.0 -I runtime/rewriter -c "$PORT/bridge.c" -o "$PORT/bridge.o"
           xcrun libtool -static -o "$PORT/libconverter.a" "$PORT/bridge.o" "${LIBS[@]}"
           cp pack/nx_unpack/*.cs "$PORT/"
+          # Preserve upstream package source mapping and exact vendored packages.
+          python3 - "$PORT" <<'PY'
+          import pathlib, sys, xml.etree.ElementTree as ET
+          root=pathlib.Path.cwd()
+          config=ET.parse(root/"pack/nx_unpack/nuget.config")
+          for node in config.findall("./packageSources/add"):
+              if node.attrib["key"]=="s2arm-ryujinx":
+                  packages=root/"compat/packages"
+                  assert packages.is_dir(), "Missing upstream package directory"
+                  for name in ("ryujinx.libhac.0.21.0-alpha.133.nupkg","zstdsharp.port.0.8.8.nupkg"):
+                      assert any(p.name.lower()==name for p in packages.iterdir()), f"Missing upstream package {name}"
+                  node.set("value",str(packages))
+          config.write(pathlib.Path(sys.argv[1])/"nuget.config", encoding="utf-8", xml_declaration=True)
+          PY
           python3 - "$PORT" <<'PY'
           import pathlib,re,sys,subprocess,json
           p=pathlib.Path(sys.argv[1]); f=p/'Program.cs'; s=f.read_text()
@@ -369,7 +383,8 @@ jobs:
           xcodebuild -version
           dotnet workload install ios --version 10.0.401
           # Match the installed .NET iOS SDK family to the selected Xcode.
-          if xcodebuild -version | grep -q "^Xcode 27"; then
+          XCODE_VERSION="$(xcodebuild -version)"
+          if [[ "$XCODE_VERSION" == "Xcode 27"* ]]; then
             sed -i '' 's|<TargetFramework>net10.0-ios</TargetFramework>|<TargetFramework>net10.0-ios27.0</TargetFramework>|' Converter.csproj
           fi
           bash build.sh "$GITHUB_WORKSPACE/upstream"

@@ -28,7 +28,7 @@ jobs:
           path: upstream
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.401'
+          dotnet-version: '10.0.402'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -203,9 +203,18 @@ jobs:
           
           [Register("AppDelegate")]
           public class AppDelegate:UIApplicationDelegate {
-              public override UIWindow Window {get;set;}
-              public override bool FinishedLaunching(UIApplication app,NSDictionary options){Window=new UIWindow(UIScreen.MainScreen.Bounds);Window.RootViewController=new ConverterView();Window.MakeKeyAndVisible();return true;}
+              public override bool FinishedLaunching(UIApplication app,NSDictionary options)=>true;
               static void Main(string[] args)=>UIApplication.Main(args,null,typeof(AppDelegate));
+          }
+          [Register("ConverterSceneDelegate")]
+          public class ConverterSceneDelegate:UIWindowSceneDelegate {
+              public override UIWindow Window {get;set;}
+              public override void WillConnect(UIScene scene,UISceneSession session,UISceneConnectionOptions connectionOptions){
+                  if(scene is not UIWindowScene windowScene)return;
+                  Window=new UIWindow(windowScene);
+                  Window.RootViewController=new ConverterView();
+                  Window.MakeKeyAndVisible();
+              }
           }
           internal sealed class ConverterView:UIViewController {
               NSUrl keys,game;bool keysScope,gameScope,used;Picker pick;UIStackView stack;UILabel status;UIButton keyButton,gameButton,run;
@@ -228,7 +237,7 @@ jobs:
           cat > Converter.csproj <<'S2ARM_SOURCE_EOF'
           <Project Sdk="Microsoft.NET.Sdk">
             <PropertyGroup>
-              <TargetFramework>net10.0-ios</TargetFramework><RuntimeIdentifier>ios-arm64</RuntimeIdentifier>
+              <TargetFramework>net10.0-ios27.1</TargetFramework><RuntimeIdentifier>ios-arm64</RuntimeIdentifier>
               <OutputType>Exe</OutputType><SupportedOSPlatformVersion>18.0</SupportedOSPlatformVersion>
               <ApplicationId>com.local.s2arm.converter.a19</ApplicationId><ApplicationTitle>S2Arm Converter</ApplicationTitle>
               <ApplicationDisplayVersion>0.2</ApplicationDisplayVersion><ApplicationVersion>2</ApplicationVersion>
@@ -259,6 +268,17 @@ jobs:
           <key>UIFileSharingEnabled</key><true/>
           <key>LSSupportsOpeningDocumentsInPlace</key><true/>
           <key>UILaunchScreen</key><dict/>
+          <key>UIApplicationSceneManifest</key>
+          <dict>
+            <key>UIApplicationSupportsMultipleScenes</key><false/>
+            <key>UISceneConfigurations</key><dict>
+              <key>UIWindowSceneSessionRoleApplication</key><array><dict>
+                <key>UISceneConfigurationName</key><string>Default Configuration</string>
+                <key>UISceneClassName</key><string>UIWindowScene</string>
+                <key>UISceneDelegateClassName</key><string>ConverterSceneDelegate</string>
+              </dict></array>
+            </dict>
+          </dict>
           </dict></plist>
           S2ARM_SOURCE_EOF
           cat > build.sh <<'S2ARM_SOURCE_EOF'
@@ -361,6 +381,7 @@ jobs:
           APP=$(find "$PORT/bin/Release" -type d -name '*.app' -print -quit)
           test -n "$APP"
           test -f "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :UIApplicationSceneManifest:UISceneConfigurations:UIWindowSceneSessionRoleApplication:0:UISceneDelegateClassName' "$APP/Info.plist" | grep -Fx ConverterSceneDelegate
           test -d "$APP/systemdata/fonts"
           test "$(find "$APP/systemdata/fonts" -name '*.bfttf' | wc -l | tr -d ' ')" = 7
           test -f "$APP/systemdata/010000000000080E/binaryList.txt"
@@ -537,18 +558,15 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/s2arm-port"
-          if [ -d /Applications/Xcode_26.6.app/Contents/Developer ]; then
-            sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
-          else
-            sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
-          fi
-          xcodebuild -version
-          dotnet workload install ios --version 10.0.401
-          # Match the installed .NET iOS SDK family to the selected Xcode.
+          sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
           XCODE_VERSION="$(xcodebuild -version)"
-          if [[ "$XCODE_VERSION" == "Xcode 27"* ]]; then
-            sed -i '' 's|<TargetFramework>net10.0-ios</TargetFramework>|<TargetFramework>net10.0-ios27.0</TargetFramework>|' Converter.csproj
-          fi
+          printf '%s\n' "$XCODE_VERSION"
+          [[ "$XCODE_VERSION" == "Xcode 27.1"* ]]
+          test "$(dotnet --version)" = 10.0.402
+          # Official .NET 10 release supporting Xcode 27.1, no validation bypass.
+          dotnet workload install ios --version 10.0.402.1
+          dotnet workload --info
+          test -d "$DOTNET_ROOT/packs/Microsoft.iOS.Sdk.net10.0_27.1/27.1.10018"
           bash build.sh "$GITHUB_WORKSPACE/upstream"
       - uses: actions/upload-artifact@v4
         with:

@@ -1,4 +1,4 @@
-name: Build MeloNX A19 v0.7 audited R3 (unsigned)
+name: Build MeloNX A19 v0.7 audited R3 SDK fix (unsigned)
 on:
   push:
     branches: [a19-experimental]
@@ -2919,7 +2919,7 @@ jobs:
            #ifdef __APPLE__
            #include <mach/mach.h>
           +#include <sys/mman.h>
-          +#include <mach/mach_vm.h>
+          +#include <mach/vm_map.h>
            #endif
            extern int32_t a19_probe_read(int64_t *, int32_t);
            extern int64_t a19_probe_frequency(void);
@@ -6383,8 +6383,6 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Validate managed engine components
         run: dotnet run --project distribution/ios/a19/engine-tests/EngineTests.csproj --configuration Release
-      - name: Build pinned MoltenVK 1.4.2 (upstream reference)
-        run: bash distribution/ios/a19/build-moltenvk.sh
       - name: Preflight reviewed sources and toolchain fingerprint
         id: preflight
         run: |
@@ -6397,6 +6395,8 @@ jobs:
           bash -n distribution/ios/a19/build-dependencies.sh
           bash -n distribution/ios/a19/package.sh
           echo "fingerprint=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; dotnet --version; rustc --version; uname -m; } | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Build pinned MoltenVK 1.4.2 (upstream reference)
+        run: bash distribution/ios/a19/build-moltenvk.sh
       - name: Restore NuGet packages
         uses: actions/cache@v4
         with:
@@ -6438,7 +6438,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: source/src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
-          key: core-a19-v07-audited-r3-fcf129819bf4ce66f1427b1a-${{ steps.preflight.outputs.fingerprint }}-f925129209afd55927a0201d82285b8fa4b7ba30-${{ hashFiles('source/distribution/ios/build.sh') }}
+          key: core-a19-v07-audited-r3-sdkfix-fcf129819bf4ce66f1427b1a-${{ steps.preflight.outputs.fingerprint }}-f925129209afd55927a0201d82285b8fa4b7ba30-${{ hashFiles('source/distribution/ios/build.sh') }}
       - name: Compile Ryujinx core if needed
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: distribution/ios/build.sh

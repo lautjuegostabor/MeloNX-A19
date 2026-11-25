@@ -146,6 +146,40 @@ jobs:
           (root/"A19CORE-STABILITY.json").write_text(json.dumps({n:v[2] for n,v in result.items()},indent=2))
           print("Verified nine source files; stack regression and extraction checkpoint tests are required by the build.")
           PY
+      - name: Verify reflection-free conversion and regression fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib, hashlib, json
+          root=pathlib.Path("upstream")
+          checks={}
+          def edit(name,before,after,replacements):
+              p=root/name
+              data=p.read_bytes()
+              assert hashlib.sha256(data).hexdigest()==before,name
+              for old,new in replacements:
+                  assert data.count(old.encode())==1,name
+                  data=data.replace(old.encode(),new.encode())
+              assert hashlib.sha256(data).hexdigest()==after,name
+              p.write_bytes(data)
+              checks[name]=after
+          edit("services/aot/A19Converter/PackageCheckpoint.cs","d9222ac764f851e92efd98dd53e0ff8a297a42ca94a5b5b3e2a78511008dd38c","b05c4ba3b9cb2706fbfa6de1f515c2ba57855611428241822458bc2ec1fb6702",[
+              ('        var data=JsonSerializer.SerializeToUtf8Bytes(new {abi=GeneratedVersion.HostAbi,romHash,romSize=new FileInfo(rom).Length,files=Inputs(root).Select(p=>new {path=Path.GetRelativePath(root,p),size=new FileInfo(p).Length,sha=ConverterFormats.Sha(p)}).ToArray()});',
+               "        using var buffer=new MemoryStream();\n        using(var writer=new Utf8JsonWriter(buffer)){\n            writer.WriteStartObject();writer.WriteNumber(\"abi\",GeneratedVersion.HostAbi);writer.WriteString(\"romHash\",romHash);writer.WriteNumber(\"romSize\",new FileInfo(rom).Length);\n            writer.WriteStartArray(\"files\");foreach(string p in Inputs(root)){writer.WriteStartObject();writer.WriteString(\"path\",Path.GetRelativePath(root,p));writer.WriteNumber(\"size\",new FileInfo(p).Length);writer.WriteString(\"sha\",ConverterFormats.Sha(p));writer.WriteEndObject();}\n            writer.WriteEndArray();writer.WriteEndObject();writer.Flush();\n        }\n        byte[] data=buffer.ToArray();")])
+          edit("a19-tests/converter-checkpoint.cs","d5fb8eee3a6fad925ecbe90187121c40bb28110ff828d2b4e23c972ff9911ec9","78c8253b4ec2e114a51086ea3c261dbe58e7e33f1ccba26d0727bfd75ed518ec",[
+              ('            var meta=JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string,object>{{"title_id",gid},{"host_abi",GeneratedVersion.HostAbi},{"rewriter_id",GeneratedVersion.Rewriter},{"image","image.dylib"},{"image_sha256",ConverterFormats.Sha(dylib)}});','            var meta=Json(w=>{w.WriteString("title_id",gid);w.WriteNumber("host_abi",GeneratedVersion.HostAbi);w.WriteString("rewriter_id",GeneratedVersion.Rewriter);w.WriteString("image","image.dylib");w.WriteString("image_sha256",ConverterFormats.Sha(dylib));});'),
+              ('JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string,string>{{"index_sha256",ConverterFormats.Sha(ix)}})','Json(w=>w.WriteString("index_sha256",ConverterFormats.Sha(ix)))'),
+              ('    static void Main(){string root=','    static byte[] Json(Action<Utf8JsonWriter> write){using var m=new MemoryStream();using(var w=new Utf8JsonWriter(m)){w.WriteStartObject();write(w);w.WriteEndObject();}return m.ToArray();}\n    static void Main(){Check(!JsonSerializer.IsReflectionEnabledByDefault,"Tests must disable reflection-based JSON");string root=')])
+          edit("a19-tests/ConverterTests.csproj","a46b9360c4508bab076ae71d7304636ff93b4ba7a334bf18f3ef848f5efa9694","9c35f5384238bf32a8ae28997934612629d4146480439cd3d6487e29aff277d4",[
+              ('<OutputType>Exe</OutputType>','<OutputType>Exe</OutputType><JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>')])
+          for p in (root/"services/aot/A19Converter").glob("*.cs"):
+              for line in p.read_text().splitlines():
+                  if line.lstrip().startswith("//"): continue
+                  assert "JsonSerializer.SerializeToUtf8Bytes" not in line,p
+                  if "JsonSerializer.Serialize(" in line: assert "InspectJsonContext.Default.InspectResult" in line,p
+          (root/"A19CORE-AOT-AUDIT.json").write_text(json.dumps(checks,indent=2))
+          PY
       - name: Prepare Apple Silicon and pinned dependencies
         working-directory: upstream
         shell: bash
@@ -202,4 +236,5 @@ jobs:
             upstream/A19CORE-BUILD-FIXES.json
             upstream/A19CORE-IMPORT-AUDIT.json
             upstream/A19CORE-STABILITY.json
+            upstream/A19CORE-AOT-AUDIT.json
           if-no-files-found: ignore

@@ -1,0 +1,99 @@
+name: A19Core exact checkpoint - iPhone 17
+on:
+  workflow_dispatch:
+  push:
+    branches: [a19core-native-integration]
+    paths: ['A19Core-recovery-checkpoint.zip']
+permissions:
+  contents: read
+concurrency:
+  group: a19core-checkpoint-build
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: project
+          sparse-checkout: |
+            A19Core-recovery-checkpoint.zip
+          sparse-checkout-cone-mode: false
+      - uses: actions/checkout@v4
+        with:
+          repository: jhaizhou-ops/S2Arm
+          ref: 39d35671a57ee30d5f528c13d206fd6309a84b8f
+          path: upstream
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.402'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify and restore exact A19Core source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C upstream rev-parse HEAD)" = 39d35671a57ee30d5f528c13d206fd6309a84b8f
+          python - <<'PY'
+          import hashlib, json, pathlib, zipfile
+          archive = pathlib.Path("project/A19Core-recovery-checkpoint.zip")
+          root = pathlib.Path("upstream")
+          assert hashlib.file_digest(archive.open("rb"), "sha256").hexdigest() == "13ebf138e16c0136a6bd36345160b93bfe4e7d3b89a43535fee5641648517ae3", "Incorrect checkpoint"
+          with zipfile.ZipFile(archive) as z:
+              assert z.testzip() is None
+              manifest = json.loads(z.read("A19CORE-WORK-STATE.json"))
+              expected = manifest["modified"] | manifest["added"]
+              assert len(expected) == 58
+              assert len(z.namelist()) == 59 and set(z.namelist()) == set(expected) | {"A19CORE-WORK-STATE.json"}
+              for name, digest in expected.items():
+                  p = pathlib.PurePosixPath(name)
+                  assert not p.is_absolute() and ".." not in p.parts
+                  assert hashlib.sha256(z.read(name)).hexdigest() == digest, name
+              assert manifest["removed"] == ["runtime/src/imgpack.c"]
+              for name in manifest["removed"]:
+                  (root / name).unlink()
+              z.extractall(root)
+              for name, digest in expected.items():
+                  assert hashlib.sha256((root / name).read_bytes()).hexdigest() == digest
+          print("Restored all 59 checkpoint files; 58 per-file hashes verified.")
+          PY
+      - name: Prepare Apple Silicon and pinned dependencies
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          for pair in gmake:make ninja:ninja meson:meson cmake:cmake; do
+            command -v "${pair%:*}" >/dev/null || brew install "${pair#*:}"
+          done
+          xcrun --find metal || xcodebuild -downloadComponent MetalToolchain
+          python runtime/rewriter/prepare_deps.py "$RUNNER_TEMP/a19core-deps"
+          python tools/a19-preflight.py --deps "$RUNNER_TEMP/a19core-deps"
+      - name: Compile exact A19Core integrated source
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$DOTNET_ROOT:$PATH"
+          mkdir -p "$RUNNER_TEMP/a19core-out"
+          bash tools/a19-build-local.sh --build "$RUNNER_TEMP/a19core-deps" "$RUNNER_TEMP/a19core-out/A19Core-unsigned.ipa"
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: A19Core-iPhone17-unsigned
+          path: ${{ runner.temp }}/a19core-out/A19Core-unsigned.ipa
+          if-no-files-found: error
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A19Core-checkpoint-build-diagnostics
+          path: |
+            ${{ runner.temp }}/a19core-out/*.log
+            upstream/build/rewriter-symbols.txt
+            upstream/A19CORE-WORK-STATE.json
+          if-no-files-found: ignore

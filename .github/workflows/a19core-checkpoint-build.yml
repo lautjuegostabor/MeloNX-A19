@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: [a19core-native-integration]
-    paths: ['A19Core-source-transfer.txt']
+    paths: ['A19Core-source-transfer.txt', '.github/workflows/a19core-checkpoint-build.yml']
 permissions:
   contents: read
 concurrency:
@@ -82,12 +82,28 @@ jobs:
           test "$(uname -m)" = arm64
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
-          for pair in gmake:make ninja:ninja meson:meson cmake:cmake; do
+          for pair in gmake:make ninja:ninja meson:meson cmake:cmake rg:ripgrep; do
             command -v "${pair%:*}" >/dev/null || brew install "${pair#*:}"
           done
           xcrun --find metal || xcodebuild -downloadComponent MetalToolchain
           python runtime/rewriter/prepare_deps.py "$RUNNER_TEMP/a19core-deps"
           python tools/a19-preflight.py --deps "$RUNNER_TEMP/a19core-deps"
+      - name: Fix Darwin file-open feature visibility and check SDK
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, pathlib, json
+          p = pathlib.Path("runtime/src/a19_image.c")
+          original = p.read_bytes()
+          marker = b"#define _POSIX_C_SOURCE 200809L\n"
+          assert original.startswith(marker)
+          fixed = b"#ifdef __APPLE__\n#define _DARWIN_C_SOURCE 1\n#endif\n" + original
+          p.write_bytes(fixed)
+          pathlib.Path("A19CORE-BUILD-FIXES.json").write_text(json.dumps({"runtime/src/a19_image.c":{"before":hashlib.sha256(original).hexdigest(),"after":hashlib.sha256(fixed).hexdigest(),"reason":"Expose Darwin O_NOFOLLOW without dropping symlink protection"}}, indent=2))
+          PY
+          printf '#define _DARWIN_C_SOURCE 1\n#define _POSIX_C_SOURCE 200809L\n#include <fcntl.h>\nint flags = O_NOFOLLOW | O_DIRECTORY;\n' | xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=26.0 -x c -fsyntax-only -
       - name: Compile exact A19Core integrated source
         working-directory: upstream
         shell: bash
@@ -111,4 +127,5 @@ jobs:
             ${{ runner.temp }}/a19core-out/*.log
             upstream/build/rewriter-symbols.txt
             upstream/A19CORE-WORK-STATE.json
+            upstream/A19CORE-BUILD-FIXES.json
           if-no-files-found: ignore

@@ -9,7 +9,7 @@ permissions:
   statuses: write
 concurrency:
   group: a19core-import-host
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   host:
     runs-on: xcode-27
@@ -25,6 +25,7 @@ jobs:
           sparse-checkout: |
             a19core/native
             a19core/converter
+            a19core/tests
       - uses: actions/checkout@v4
         with:
           repository: jhaizhou-ops/S2Arm
@@ -84,6 +85,9 @@ jobs:
           # Policy check uses the same original C source linked into the real host.
           xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -I"$SRC" "$SRC/a19_policy.c" "$SRC/policy_test.c" -o "$RUNNER_TEMP/policy-test"
           "$RUNNER_TEMP/policy-test"
+      - name: Verify exact IMG output without backwards copy
+        working-directory: project/a19core/tests
+        run: dotnet run --project ImageTest.csproj -c Release
       - name: Compile converter and integrate into the same NativeAOT image
         working-directory: upstream
         run: |
@@ -105,7 +109,16 @@ jobs:
           assert rs.count('const long ImageChunk = 8L << 20;')==1
           rs=rs.replace('const long ImageChunk = 8L << 20;','const long ImageChunk = 4L << 20;')
           assert rs.count('parallelism <= 0 ? Environment.ProcessorCount : parallelism')==2
-          rf.write_text(rs.replace('parallelism <= 0 ? Environment.ProcessorCount : parallelism','parallelism <= 0 ? Math.Min(2, Environment.ProcessorCount) : Math.Min(2, parallelism)'))
+          rs=rs.replace('parallelism <= 0 ? Environment.ProcessorCount : parallelism','parallelism <= 0 ? Math.Min(2, Environment.ProcessorCount) : Math.Min(2, parallelism)')
+          def once(s,a,b):
+              assert s.count(a)==1,a
+              return s.replace(a,b)
+          rs=once(rs,'internal const string ImageName = "romfs.std";','internal const string ImageName = "romfs.std";\n    internal static bool A19ReserveImageHeader;\n    internal static string A19ImageHash;')
+          rs=once(rs,'int parts = checked((int)Math.Max(1, (total + chunkSize - 1) / chunkSize));','long prefix=A19ReserveImageHeader?0x4000:0;\n            using var hash=prefix!=0?System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256):null;\n            int parts = checked((int)Math.Max(1, (total + chunkSize - 1) / chunkSize));')
+          rs=once(rs,'FileOptions.None, total);','FileOptions.None, checked(total+prefix));')
+          rs=once(rs,'RandomAccess.Write(handle, got.Buf.AsSpan(0, got.Len), lo);','RandomAccess.Write(handle, got.Buf.AsSpan(0, got.Len), checked(lo+prefix));\n                    hash?.AppendData(got.Buf,0,got.Len);')
+          rs=once(rs,'if (!errors.IsEmpty) throw new AggregateException(errors);\n            return new Result(files.Count, files.Sum(e => e.Size), workers, false);','if (!errors.IsEmpty) throw new AggregateException(errors);\n            if(hash!=null)A19ImageHash=Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();\n            return new Result(files.Count, files.Sum(e => e.Size), workers, false);')
+          rf.write_text(rs)
           a=re.search(r'#define\s+S2A_HOST_ABI\s+(\d+)',pathlib.Path('runtime/include/s2a_host_abi.h').read_text()).group(1)
           c=re.search(r'#define\s+DMSH_CHAIN\s+"([^"]+)"',pathlib.Path('graphics/nvn/gfx/nvn/dmsh_chain.h').read_text()).group(1)
           raw=subprocess.check_output([sys.executable,'pack/rewriter.py','source'],text=True)

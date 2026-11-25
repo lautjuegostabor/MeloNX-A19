@@ -20,6 +20,7 @@ jobs:
           sparse-checkout: |
             A19Core-source-transfer.txt
             a19core/fixes/import-audit.patch.gz.b64
+            a19core/fixes/stability-stage2.json.gz.b64
           sparse-checkout-cone-mode: false
       - uses: actions/checkout@v4
         with:
@@ -116,6 +117,35 @@ jobs:
           (root/"A19CORE-IMPORT-AUDIT.json").write_text(json.dumps(expected,indent=2))
           print("Verified all eight corrected source files, including test scope fix.")
           PY
+      - name: Restore verified stack and extraction recovery corrections
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib, json, hashlib, gzip, base64
+          root=pathlib.Path("upstream")
+          raw=gzip.decompress(base64.b64decode(pathlib.Path("project/a19core/fixes/stability-stage2.json.gz.b64").read_bytes().strip(),validate=True))
+          assert hashlib.sha256(raw).hexdigest()=="f6c384135d0a93c6750e0049eb3450c122c5a9a34ae93c126e753501211a4372"
+          ops=json.loads(raw)
+          assert len(ops)==9
+          result={}
+          for name,(before,after,edits) in ops.items():
+              rel=pathlib.PurePosixPath(name)
+              assert not rel.is_absolute() and ".." not in rel.parts
+              p=root/rel
+              data=p.read_bytes() if p.exists() else b""
+              assert hashlib.sha256(data).hexdigest()==before,name
+              for pos,size,insert in reversed(edits):
+                  assert 0<=pos<=len(data) and 0<=size<=len(data)-pos,name
+                  data=data[:pos]+insert.encode()+data[pos+size:]
+              assert hashlib.sha256(data).hexdigest()==after,name
+              result[name]=(p,data,after)
+          for p,data,after in result.values():
+              p.parent.mkdir(parents=True,exist_ok=True)
+              p.write_bytes(data)
+          (root/"A19CORE-STABILITY.json").write_text(json.dumps({n:v[2] for n,v in result.items()},indent=2))
+          print("Verified nine source files; stack regression and extraction checkpoint tests are required by the build.")
+          PY
       - name: Prepare Apple Silicon and pinned dependencies
         working-directory: upstream
         shell: bash
@@ -171,4 +201,5 @@ jobs:
             upstream/A19CORE-WORK-STATE.json
             upstream/A19CORE-BUILD-FIXES.json
             upstream/A19CORE-IMPORT-AUDIT.json
+            upstream/A19CORE-STABILITY.json
           if-no-files-found: ignore

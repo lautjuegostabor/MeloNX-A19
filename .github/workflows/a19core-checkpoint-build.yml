@@ -21,6 +21,7 @@ jobs:
             A19Core-source-transfer.txt
             a19core/fixes/import-audit.patch.gz.b64
             a19core/fixes/stability-stage2.json.gz.b64
+            a19core/fixes/upstream-parity.json.gz.b64
           sparse-checkout-cone-mode: false
       - uses: actions/checkout@v4
         with:
@@ -180,6 +181,45 @@ jobs:
                   if "JsonSerializer.Serialize(" in line: assert "InspectJsonContext.Default.InspectResult" in line,p
           (root/"A19CORE-AOT-AUDIT.json").write_text(json.dumps(checks,indent=2))
           PY
+      - name: Restore baseline compatibility and transactional resource recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib, json, hashlib, gzip, base64
+          root=pathlib.Path("upstream")
+          raw=gzip.decompress(base64.b64decode(pathlib.Path("project/a19core/fixes/upstream-parity.json.gz.b64").read_bytes().strip(),validate=True))
+          assert hashlib.sha256(raw).hexdigest()=="5ed5b15b63abb9c33b34d06fa4b63e364f560a726ca3172a71ee18b68759cd92"
+          ops=json.loads(raw)
+          assert len(ops)==6
+          result={}
+          for name,(before,after,edits) in ops.items():
+              rel=pathlib.PurePosixPath(name)
+              assert not rel.is_absolute() and ".." not in rel.parts
+              p=root/rel
+              data=p.read_bytes() if p.exists() else b""
+              assert hashlib.sha256(data).hexdigest()==before,name
+              lines=data.splitlines(True)
+              for i,j,insert in reversed(edits):
+                  lines[i:j]=[insert.encode()]
+              data=b"".join(lines)
+              assert hashlib.sha256(data).hexdigest()==after,name
+              result[name]=(p,data,after)
+          for p,data,after in result.values():
+              p.parent.mkdir(parents=True,exist_ok=True)
+              p.write_bytes(data)
+          (root/"A19CORE-UPSTREAM-PARITY.json").write_text(json.dumps({n:v[2] for n,v in result.items()},indent=2))
+          PY
+      - name: Gate expensive build on upstream byte parity and reflection-free recovery
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(dotnet --version)" = 10.0.402
+          unset S2A_APPLE_OS
+          export A19_PARITY_DIR="$(mktemp -d)"
+          python a19-tests/upstream-parity.py "$PWD" "$A19_PARITY_DIR"
+          dotnet run --project a19-tests/ConverterTests.csproj -c Release
       - name: Prepare Apple Silicon and pinned dependencies
         working-directory: upstream
         shell: bash
@@ -237,4 +277,5 @@ jobs:
             upstream/A19CORE-IMPORT-AUDIT.json
             upstream/A19CORE-STABILITY.json
             upstream/A19CORE-AOT-AUDIT.json
+            upstream/A19CORE-UPSTREAM-PARITY.json
           if-no-files-found: ignore

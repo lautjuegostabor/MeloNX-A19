@@ -6,6 +6,7 @@ El informe de investigación posterior revisa la elección de S2Arm del traspaso
 |---|---|---|---|---|---|
 | MeloNX v0.6 de referencia | Fuente `f925129`, overlay SHA-256 fijado y cuatro parches de `1b9e58a` restaurados | Aplicación de los parches históricos | Build histórica según el traspaso | Juegos funcionales en el historial | Pendiente |
 | Candidato v0.6 instrumentado | Parche acotado a métricas de preparación de programas, lock y creación Vulkan | Backend Vulkan Release, prueba C de JSONL con core simulado y 72 contadores, acumulación C# concurrente | Pendiente de CI | Pendiente | Pendiente |
+| Candidato Apple10 con creación al primer uso | Opción para iPhone 17 base con `MTLDevice.supportsFamily(.apple10)`, desactivada por defecto | Backend Vulkan Release, enlace de módulos pendiente/listo/fallido y JSONL de 73 contadores | Pendiente | Pendiente | Pendiente |
 | Checkpoint nativo `0100170` | Restauración con hashes desde S2Arm `39d35671` | Sintaxis de claves, extracción, IMG/USTAR, tabla de drivers y recuperación de paquete sintéticos | [IPA histórico](https://github.com/lautjuegostabor/MeloNX-A19/actions/runs/45578939713) | Flujo completo pendiente | Pendiente |
 | Checkpoint nativo `1f6c660` y gate actualizado | Restauración con hashes y selección exacta del SDK | Pruebas anteriores, paridad Mach-O normal/FAR/biased-dual, ejecutable de fixtures NativeAOT y DFS diferencial | [Falló el CI histórico](https://github.com/lautjuegostabor/MeloNX-A19/actions/runs/45579611946). Gate actualizado probado en Linux | Pendiente | Pendiente |
 
@@ -31,3 +32,18 @@ El job histórico instala 10.0.402 y termina con código 1 antes de generar fixt
 La versión 3 agrega cinco contadores acumulativos y preserva los índices históricos. El delta de `foreground_pipeline_create_calls` cuenta llamadas Vulkan de creación desde el camino síncrono de enlace a dibujo o dispatch. `foreground_pipeline_lock_ticks` abarca desde antes de entrar al lock hasta comenzar la llamada al driver. `foreground_pipeline_create_ticks` cubre la llamada, independientemente del resultado Vulkan. `foreground_program_ready_*` mide los intentos bloqueantes de preparación en ese camino, incluida la comprobación de disponibilidad y su trabajo síncrono. Dividir los ticks por `stopwatchFrequency`. Los contadores de creación global incluyen los de foreground, y el tiempo de preparación puede incluir trabajo de compilación. No sumar estas métricas como tiempo perdido por frame. Los contadores nuevos no registran el scanout ni reemplazan una medición de latencia física o de overhead.
 
 Cuando exista un IPA validado por CI, la prueba física diagnóstica es una sola carga del juego reportado. Con la configuración efectiva de MeloNX estable y una condición térmica inicial comparable, iniciar la captura en A19 Lab, recorrer una escena con el problema y repetirla desde el mismo punto en esa sesión. Exportar el JSON y el JSONL al terminar. Efectos visuales, bloqueos y errores de arranque se registran como fallos. La captura sola no establece superioridad frente a MeloNX o S2Arm. El flujo nativo de conversión/importación/firma y el rendimiento sostenido siguen pendientes de validación en el dispositivo.
+
+
+## Candidato Apple10 local
+
+La ruta heredada prepara un pipeline con estado aproximado para un programa recién traducido, antes de conocer el estado con el que se emitirá el dibujo o dispatch. Con la opción **Apple10 pipelines on first use**, los programas de esa ruta preparan sus módulos y usan la creación existente de Vulkan al primer uso con estado real. Se conservan las rutas de programas recuperados del caché y las que usan compilación asíncrona. La modificación mantiene el lock de Vulkan, los formatos de shader y el orden de render. El nuevo contador `deferred_apple10_pipeline_warmups` comprueba cuántas veces se eligió esta ruta y es independiente de los tiempos de espera y de creación.
+
+La captura de BOTW indica contención en el comienzo de la parte jugable. No cuantifica cuántas preparaciones anticipadas se reutilizaban. Si se reutilizaban con frecuencia, pasar a primer uso puede trasladar trabajo al dibujo. Los envíos Vulkan por fotograma se evalúan por separado. El cambio no introduce un backend Metal nativo ni demuestra una mejora sostenida.
+
+```sh
+bash a19core/melonx/restore-v06.sh ../melonx-apple10 --apple10
+python3 a19core/melonx/check-telemetry.py ../melonx-apple10 --schema 4
+dotnet run --project a19core/melonx/apple10-tests/Apple10.Tests.csproj -c Release -p:MeloNXSource="$(cd ../melonx-apple10 && pwd)"
+```
+
+El fixture maneja objetos `ShaderCollection` del backend real con módulos simulados. Comprueba el contrato de preparación de etapas sin ejecutar Vulkan, Metal o un juego. El IPA de la ejecución 45621276570 es la referencia de diagnóstico anterior.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 2 || ( $# -eq 2 && "$2" != "--instrument" ) ]]; then
-    echo "Usage: bash $0 NEW_WORKTREE [--instrument]" >&2
+if [[ $# -lt 1 || $# -gt 2 || ( $# -eq 2 && "$2" != "--instrument" && "$2" != "--apple10" ) ]]; then
+    echo "Usage: bash $0 NEW_WORKTREE [--instrument|--apple10]" >&2
     exit 2
 fi
 
@@ -53,7 +53,12 @@ for phase in review lab v05 v06; do
 done
 chmod +x "$destination"/distribution/ios/a19/*.sh "$destination/distribution/ios/build.sh"
 
-if [[ "${2:-}" == "--instrument" ]]; then
+if [[ -n "${2:-}" ]]; then
     git -C "$destination" apply --check "$script_dir/pipeline-telemetry.patch"
     git -C "$destination" apply "$script_dir/pipeline-telemetry.patch"
+fi
+
+if [[ "${2:-}" == "--apple10" ]]; then
+    git -C "$destination" apply --check "$script_dir/apple10-first-use-pipelines.patch"
+    git -C "$destination" apply "$script_dir/apple10-first-use-pipelines.patch"
 fi

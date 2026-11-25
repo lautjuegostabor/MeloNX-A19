@@ -8,6 +8,7 @@ import tempfile
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("source", type=pathlib.Path, help="Instrumented MeloNX worktree")
+parser.add_argument("--schema", type=int, default=3, help="Expected trace schema")
 args = parser.parse_args()
 common = args.source.resolve() / "src/MeloNX/MeloNX/Common"
 managed = args.source / "src/Ryujinx.Common/A19Probe.cs"
@@ -55,8 +56,8 @@ int main(int argc, char **argv) {
     )
     subprocess.run([str(executable), str(trace)], check=True)
     header, *samples = map(json.loads, trace.read_text().splitlines())
-    if header["schemaVersion"] != 3 or header["counterNames"] != names:
+    if header["schemaVersion"] != args.schema or header["counterNames"] != names:
         raise SystemExit("Native and Swift trace schemas differ")
     if not samples or any(sample["counters"] != list(range(count)) for sample in samples):
         raise SystemExit("Native trace did not record every counter in order")
-    print(f"PASS native JSONL writer, schema 3, {count} counters")
+    print(f"PASS native JSONL writer, schema {args.schema}, {count} counters")

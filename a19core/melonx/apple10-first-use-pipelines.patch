@@ -1,0 +1,159 @@
+--- a/src/Ryujinx.Common/A19Probe.cs
++++ b/src/Ryujinx.Common/A19Probe.cs
+@@ -12,15 +12,17 @@
+         public const int ForegroundPipelineLockTicks = 69;
+         public const int ForegroundProgramReadyCalls = 70;
+         public const int ForegroundProgramReadyTicks = 71;
+-        public const int Count = 72;
++        public const int DeferredApple10PipelineWarmups = 72;
++        public const int Count = 73;
+         // A19 reports 128-byte cache lines. 256-byte stride also prevents adjacent counters sharing a line.
+         private const int Stride = 32;
+         private static readonly long[] Values = new long[Count * Stride];
+         private static int _enabled, _argumentBuffers, _commandLimit, _shaderWorkers, _jitPadCalls;
+         private static int _experiments, _nativeHalfSupported;
+         public static bool Experiment(int mask) => OperatingSystem.IsIOS() && (Volatile.Read(ref _experiments) & mask) != 0;
++        public static bool DeferApple10PipelineWarmup => Experiment(32);
+         public static bool NativeHalf => Experiment(2) && Volatile.Read(ref _nativeHalfSupported) != 0;
+-        public static void SetExperiments(int mask) => Volatile.Write(ref _experiments, mask & 31);
++        public static void SetExperiments(int mask) => Volatile.Write(ref _experiments, mask & 63);
+         public static void SetNativeHalfSupported(bool supported) => Volatile.Write(ref _nativeHalfSupported, supported ? 1 : 0);
+         public static bool Enabled => Volatile.Read(ref _enabled) != 0;
+         public static int ArgumentBuffers => Volatile.Read(ref _argumentBuffers);
+--- a/src/Ryujinx.Graphics.Vulkan/ShaderCollection.cs
++++ b/src/Ryujinx.Graphics.Vulkan/ShaderCollection.cs
+@@ -1,3 +1,4 @@
++using Ryujinx.Common;
+ using Ryujinx.Common.Logging;
+ using Ryujinx.Graphics.GAL;
+ using Silk.NET.Vulkan;
+@@ -64,7 +65,8 @@
+
+         private readonly VulkanRenderer _gd;
+         private Device _device;
+-        private bool _initialized;
++        private volatile bool _initialized;
++        private readonly bool _createPipelineOnFirstUse;
+
+         private ProgramPipelineState _state;
+         private DisposableRenderPass _dummyRenderPass;
+@@ -190,8 +192,21 @@
+
+             if (!compileInBackground)
+             {
+-                _compileTask = BackgroundCompilation();
+-                _firstBackgroundUse = !fromCache;
++                _createPipelineOnFirstUse = !fromCache && gd.IsMoltenVk && A19Probe.DeferApple10PipelineWarmup;
++
++                if (_createPipelineOnFirstUse)
++                {
++                    // Runtime programs can use the actual draw or dispatch state instead of
++                    // preparing an estimated pipeline that competes with the render thread.
++                    _compileTask = Task.WhenAll(_shaders.Select(shader => shader.CompileTask));
++                    A19Probe.Add(A19Probe.DeferredApple10PipelineWarmups);
++                }
++                else
++                {
++                    _compileTask = BackgroundCompilation();
++                    _firstBackgroundUse = !fromCache;
++                }
++
+                 return;
+             }
+
+@@ -793,6 +808,12 @@
+
+         public PipelineShaderStageCreateInfo[] GetInfos()
+         {
++            if (_createPipelineOnFirstUse)
++            {
++                EnsureShadersReady(blocking: true);
++                return _infos;
++            }
++
+             if (!CompilesInBackground)
+             {
+                 EnsureShadersReadyLegacy();
+@@ -886,6 +907,12 @@
+
+         public ProgramLinkStatus CheckProgramLink(bool blocking)
+         {
++            if (_createPipelineOnFirstUse)
++            {
++                EnsureShadersReady(blocking);
++                return LinkStatus;
++            }
++
+             if (!CompilesInBackground)
+             {
+                 if (LinkStatus == ProgramLinkStatus.Incomplete)
+--- a/src/MeloNX/MeloNX/Common/A19Lab.swift
++++ b/src/MeloNX/MeloNX/Common/A19Lab.swift
+@@ -25,7 +25,8 @@
+     "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes",
+     "mvk_statistics_result", "mvk_spirv_to_msl_count", "mvk_spirv_to_msl_avg_us", "mvk_msl_compile_count", "mvk_msl_compile_avg_us", "mvk_shader_cache_count", "mvk_shader_cache_avg_us", "mvk_pipeline_compile_count", "mvk_pipeline_compile_avg_us", "mvk_retrieve_command_count", "mvk_retrieve_command_avg_us", "mvk_encode_command_count", "mvk_encode_command_avg_us", "mvk_execute_command_count", "mvk_execute_command_avg_us", "mvk_gpu_memory_count", "mvk_gpu_memory_avg_kib_x1000",
+     "jit_masked_index_fusions", "native_fp16_guest_ops", "tile_clear_passes", "retained_block_reuses", "retained_block_reuse_bytes", "qos_set_failures",
+-    "foreground_pipeline_create_calls", "foreground_pipeline_create_ticks", "foreground_pipeline_lock_ticks", "foreground_program_ready_calls", "foreground_program_ready_ticks"
++    "foreground_pipeline_create_calls", "foreground_pipeline_create_ticks", "foreground_pipeline_lock_ticks", "foreground_program_ready_calls", "foreground_program_ready_ticks",
++    "deferred_apple10_pipeline_warmups"
+ ]
+ private let a19Gauges = Set(29...35).union(44...60)
+
+@@ -125,8 +126,17 @@
+     @Published var tileClear = false
+     @Published var reuseBlocks = false
+     @Published var workerQoS = false
++    @Published var apple10PipelinesOnFirstUse = false
++    private(set) lazy var supportsApple10PipelinePolicy: Bool = {
++        if #available(iOS 26.0, *), UIDevice.modelName == "iPhone 17" {
++            return MTLCreateSystemDefaultDevice()?.supportsFamily(.apple10) == true
++        }
++        return false
++    }()
+     private var experimentMask: Int {
+-        (compactJIT ? 1 : 0) | (nativeFP16 ? 2 : 0) | (tileClear ? 4 : 0) | (reuseBlocks ? 8 : 0) | (workerQoS ? 16 : 0)
++        let apple10Policy = supportsApple10PipelinePolicy && apple10PipelinesOnFirstUse ? 32 : 0
++        return (compactJIT ? 1 : 0) | (nativeFP16 ? 2 : 0) | (tileClear ? 4 : 0) |
++            (reuseBlocks ? 8 : 0) | (workerQoS ? 16 : 0) | apple10Policy
+     }
+     private var task: Task<Void, Never>?
+     private var samples: [A19Sample] = []
+@@ -260,7 +270,7 @@
+         writeReport()
+     }
+     private func writeReport() {
+-        let report = A19Report(schemaVersion: 3, build: "A19Core v0.6 pipeline diagnostics", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Native JSONL counters are cumulative except gauges at indices 29–35 and 44–60; export both files. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
++        let report = A19Report(schemaVersion: 4, build: "A19Core v0.6 Apple10 first-use pipelines", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Native JSONL counters are cumulative except gauges at indices 29–35 and 44–60; export both files. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
+         do { let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]; try encoder.encode(report).write(to: destination, options: .atomic); reportURL = destination }
+         catch { status = "Report could not be saved." }
+     }
+@@ -284,6 +294,9 @@
+                 Toggle("TBDR full color clear", isOn: $lab.tileClear)
+                 Toggle("Bounded Vulkan block reuse", isOn: $lab.reuseBlocks)
+                 Toggle("Shader worker QoS", isOn: $lab.workerQoS)
++                if lab.supportsApple10PipelinePolicy {
++                    Toggle("Apple10 pipelines on first use", isOn: $lab.apple10PipelinesOnFirstUse)
++                }
+                 Button("Apply for next game") { lab.apply() }
+             }.disabled(lab.running || lab.benchmarking)
+             Section("Core trace") {
+--- a/src/MeloNX/MeloNX/Common/A19Bench.c
++++ b/src/MeloNX/MeloNX/Common/A19Bench.c
+@@ -84,7 +84,7 @@
+ #ifdef __APPLE__
+ #include <mach/mach.h>
+ #endif
+-enum { A19_COUNTER_COUNT = 72 };
++enum { A19_COUNTER_COUNT = 73 };
+ extern int32_t a19_probe_read(int64_t *, int32_t);
+ extern int64_t a19_probe_frequency(void);
+ static pthread_t trace_thread;
+@@ -138,7 +138,7 @@
+     atomic_store(&trace_count, 0); atomic_store(&trace_error, 0);
+     trace_file = fopen(path, "w");
+     if (!trace_file) return 0;
+-    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":3,\"build\":\"A19Core v0.6 pipeline diagnostics\",\"stopwatchFrequency\":%" PRId64 ",\"counterMode\":\"cumulative except gauges 29-35 and 44-60\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\",\"jit_masked_index_fusions\",\"native_fp16_guest_ops\",\"tile_clear_passes\",\"retained_block_reuses\",\"retained_block_reuse_bytes\",\"qos_set_failures\",\"foreground_pipeline_create_calls\",\"foreground_pipeline_create_ticks\",\"foreground_pipeline_lock_ticks\",\"foreground_program_ready_calls\",\"foreground_program_ready_ticks\"]}\n", a19_probe_frequency());
++    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":4,\"build\":\"A19Core v0.6 Apple10 first-use pipelines\",\"stopwatchFrequency\":%" PRId64 ",\"counterMode\":\"cumulative except gauges 29-35 and 44-60\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\",\"jit_masked_index_fusions\",\"native_fp16_guest_ops\",\"tile_clear_passes\",\"retained_block_reuses\",\"retained_block_reuse_bytes\",\"qos_set_failures\",\"foreground_pipeline_create_calls\",\"foreground_pipeline_create_ticks\",\"foreground_pipeline_lock_ticks\",\"foreground_program_ready_calls\",\"foreground_program_ready_ticks\",\"deferred_apple10_pipeline_warmups\"]}\n", a19_probe_frequency());
+     if (!trace_flush(trace_file)) { fclose(trace_file); return 0; }
+     atomic_store(&trace_running, 1);
+     if (pthread_create(&trace_thread, NULL, trace_worker, NULL) != 0) {

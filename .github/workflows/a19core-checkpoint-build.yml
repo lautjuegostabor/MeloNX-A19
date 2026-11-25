@@ -19,6 +19,7 @@ jobs:
           path: project
           sparse-checkout: |
             A19Core-source-transfer.txt
+            a19core/fixes/import-audit.patch.gz.b64
           sparse-checkout-cone-mode: false
       - uses: actions/checkout@v4
         with:
@@ -74,6 +75,37 @@ jobs:
               assert hashlib.sha256(safe_path(name).read_bytes()).hexdigest() == digest
           print("Restored exact production checkpoint; 58 per-file hashes verified.")
           PY
+      - name: Apply verified import and converter audit corrections
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib,base64,gzip,pathlib
+          transfer=pathlib.Path("project/a19core/fixes/import-audit.patch.gz.b64").read_bytes()
+          assert hashlib.sha256(transfer).hexdigest()=="c407e380c2a96ca7425b6742c14e7cc2f6b42b71693484839bc080945f603293"
+          patch=gzip.decompress(base64.b64decode(transfer.strip(),validate=True))
+          assert hashlib.sha256(patch).hexdigest()=="6ade5a79d8a8f7516c8ec38626baab79c5b7f8271071f1846744dca5311972d7"
+          pathlib.Path("import-audit.patch").write_bytes(patch)
+          PY
+          (cd upstream && git apply --check ../import-audit.patch && git apply ../import-audit.patch)
+          python - <<'PY'
+          import hashlib,json,pathlib
+          root=pathlib.Path("upstream")
+          expected={
+            "a19-tests/ConverterTests.csproj":"a46b9360c4508bab076ae71d7304636ff93b4ba7a334bf18f3ef848f5efa9694",
+            "a19-tests/converter-checkpoint.cs":"1579b439c9731c2f05abe1782f9dbd7fd56046c24ae497a79f0b91063cf469e5",
+            "ios/A19Library.m":"e944435288e7d0259744641762078171e87bbfb25527b5e02891956838a6963e",
+            "services/aot/A19Converter/ConvertJob.cs":"7bcfbdb9b6f42d36d3c0cb0d24ebc79e8114e10c4e5339e6736af0eb6b46c6a9",
+            "services/aot/A19Converter/Exports.cs":"1b77997107a83ffb2d6f94cf90877b1dc55f0f848a6136f1a28f046d5bcdba29",
+            "services/aot/A19Converter/InputValidation.cs":"988e33eece0142fb9dbc374a14dc334dccd37b79bcd93cd3c2a1d4250d2b1aed",
+            "services/aot/A19Converter/Program.cs":"e2a34c72088b2acf89fbf63f7ae62780629516a60c0ab5bc4a8896beee3c8e96",
+            "tools/a19-build-local.sh":"815174d33787ca907b8523345ac831b77a51a497d118bf60f8a4ec9e38582392"
+          }
+          for name,sha in expected.items():
+              assert hashlib.sha256((root/name).read_bytes()).hexdigest()==sha,name
+          (root/"A19CORE-IMPORT-AUDIT.json").write_text(json.dumps(expected,indent=2))
+          print("Verified all eight corrected source files.")
+          PY
       - name: Prepare Apple Silicon and pinned dependencies
         working-directory: upstream
         shell: bash
@@ -128,4 +160,5 @@ jobs:
             upstream/build/rewriter-symbols.txt
             upstream/A19CORE-WORK-STATE.json
             upstream/A19CORE-BUILD-FIXES.json
+            upstream/A19CORE-IMPORT-AUDIT.json
           if-no-files-found: ignore

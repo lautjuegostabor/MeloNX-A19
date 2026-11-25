@@ -24,15 +24,16 @@ static BOOL validID(NSString *s){
     return s.length==16&&[s rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789ABCDEFabcdef"] invertedSet]].location==NSNotFound;
 }
 static BOOL isTarget(void){
-    char m[64]={0};size_t n=sizeof m;
-    return !sysctlbyname("hw.machine",m,&n,NULL,0)&&!strcmp(m,"iPhone18,3")&&[MTLCreateSystemDefaultDevice() supportsFamily:MTLGPUFamilyApple10];
+    static BOOL ok;static dispatch_once_t once;
+    dispatch_once(&once, ^{char m[64]={0};size_t n=sizeof m;ok=!sysctlbyname("hw.machine",m,&n,NULL,0)&&!strcmp(m,"iPhone18,3")&&[MTLCreateSystemDefaultDevice() supportsFamily:MTLGPUFamilyApple10];});
+    return ok;
 }
 @interface A19Library:UIViewController<UITableViewDataSource,UITableViewDelegate>
-@property UITableView *table;
-@property UILabel *status;
-@property NSArray<NSDictionary*> *games;
-@property UISwitch *adaptive;
-@property NSTimer *timer;
+@property(nonatomic,strong) UITableView *table;
+@property(nonatomic,strong) UILabel *status;
+@property(nonatomic,strong) NSArray<NSDictionary*> *games;
+@property(nonatomic,strong) UISwitch *adaptive;
+@property(nonatomic,strong) NSTimer *timer;
 @end
 static __weak A19Library *library;
 @implementation A19Library

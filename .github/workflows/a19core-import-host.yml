@@ -145,75 +145,7 @@ jobs:
           RW=$(find build/ios-rewriter -name libs2a_rewriter.a -print -quit);test -s "$RW"
           LIBS=("$RW")
           xcrun nm -gU "$RW" > build/rewriter-symbols.txt
-          if ! grep -Eq '[[:space:]]T[[:space:]]_cs_open
-        working-directory: upstream
-        run: |
-          set -euxo pipefail
-          unset IPHONEOS_DEPLOYMENT_TARGET
-          export S2A_DEVELOPER_DIR="$(xcode-select -p)"
-          export DOTNET="$DOTNET_ROOT/dotnet" S2A_CS_CACHE="$RUNNER_TEMP/aot"
-          # All real subsystems linked; no upstream Swift library UI and no game in build.
-          gmake -j3 ios S2A_CS=1 S2A_SHELLUI=0 IOS_BUNDLE=local.a19core.app IOS_DISPLAY=A19Core 2>&1 | tee "$RUNNER_TEMP/host-build.log"
-      - name: Package runnable native host (unsigned)
-        working-directory: upstream
-        run: |
-          set -euxo pipefail
-          APP="$PWD/build/ios/S2Arm.app"
-          test -s "$APP/S2Arm"
-          test -d build/gal/ios/gal_helpers
-          cp -R build/gal/ios/gal_helpers "$APP/"
-          cp -R build/a19-assets/systemdata build/a19-assets/fix "$APP/"
-          python - "$APP" <<'PY'
-          import hashlib,json,pathlib,plistlib,sys
-          app=pathlib.Path(sys.argv[1]); binary=app/'S2Arm'
-          shell_id=hashlib.sha256(binary.read_bytes()).hexdigest()[:16]
-          (app/'s2a_catalogue.json').write_text(json.dumps({'schema':1,'shell_id':shell_id,'games':[]}))
-          p=app/'Info.plist';d=plistlib.loads(p.read_bytes())
-          d['CFBundleName']='A19Core';d['CFBundleDisplayName']='A19Core';d['CFBundleIdentifier']='local.a19core.app'
-          d['CFBundleShortVersionString']='0.1';d['S2AShellId']=shell_id
-          d['S2ADisplayVersion']='A19Core native integration'
-          d['CFBundleURLTypes']=[{'CFBundleURLName':'a19core','CFBundleURLSchemes':['a19core']}]
-          # Keep existing package type for import interoperability, without claiming it is our own format.
-          p.write_bytes(plistlib.dumps(d))
-          PY
-          mkdir -p "$APP/A19Licenses"
-          cp LICENSE NOTICE THIRD_PARTY_LICENSES.md "$APP/A19Licenses/"
-          cp graphics/nvn/LICENSE "$APP/A19Licenses/NVN-LICENSE"
-          cp compat/tree/LICENSE.txt "$APP/A19Licenses/RYUJINX-LICENSE"
-          cp graphics/third_party/spirv_cross/LICENSE "$APP/A19Licenses/SPIRV-CROSS-LICENSE"
-          cp "$GITHUB_WORKSPACE/project/a19core/native/README.md" "$APP/A19Licenses/A19Core-Integration.md"
-          plutil -lint "$APP/Info.plist"
-          xcrun lipo -info "$APP/S2Arm"
-          xcrun nm -gU "$APP/S2Arm" > "$RUNNER_TEMP/linked-symbols.txt"
-          for sym in _a19_convert_game _converter_rewrite _a19_import_begin _a19_frame_observe _a19_prewarm_should_stop _s2a_shell_library_vc _S2A_InitSession _s2a_dsh_compile; do
-            grep " $sym$" "$RUNNER_TEMP/linked-symbols.txt"
-          done
-          mkdir -p "$RUNNER_TEMP/out/Payload"
-          cp -R "$APP" "$RUNNER_TEMP/out/Payload/A19Core.app"
-          (cd "$RUNNER_TEMP/out"; zip -qry A19Core-import-unsigned.ipa Payload)
-          shasum -a 256 "$RUNNER_TEMP/out/A19Core-import-unsigned.ipa"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: A19Core-import-unsigned
-          path: ${{ runner.temp }}/out/A19Core-import-unsigned.ipa
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: A19Core-import-build-diagnostics
-          path: |
-            ${{ runner.temp }}/host-build.log
-            ${{ runner.temp }}/linked-symbols.txt
-          if-no-files-found: ignore
-      - name: Report outcome
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RESULT: ${{ job.status }}
-        run: |
-          state=failure; [ "$RESULT" = success ] && state=success
-          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state="$state" -f context=a19core-import-host -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
- build/rewriter-symbols.txt; then
+          if ! grep -Eq '[[:space:]]T[[:space:]]_cs_open$' build/rewriter-symbols.txt; then
             cmake --build build/ios-rewriter --config Release --target capstone_static --parallel 3
             CAP=$(find build/ios-rewriter -name libcapstone.a -print -quit);test -s "$CAP";LIBS+=("$CAP")
           fi

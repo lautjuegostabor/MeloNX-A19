@@ -1,0 +1,96 @@
+name: A19Core reusable graphics and Horizon components
+on:
+  workflow_dispatch:
+  push:
+    branches: [a19core-native-integration]
+    paths: ['.github/workflows/a19core-components.yml']
+permissions:
+  contents: read
+jobs:
+  graphics:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: jhaizhou-ops/S2Arm
+          ref: 39d35671a57ee30d5f528c13d206fd6309a84b8f
+          path: upstream
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build real Metal, NVN and shader translation archives for iPhone
+        working-directory: upstream
+        run: |
+          set -euxo pipefail
+          export S2A_DEVELOPER_DIR="$(xcode-select -p)"
+          xcodebuild -version
+          test -s compat/tree/src/Ryujinx.Graphics.Vulkan/Effects/Textures/SmaaAreaTexture.bin
+          test -s graphics/third_party/spirv_cross/spirv_msl.cpp
+          # Compile reusable libraries rather than the S2Arm app.
+          make -C graphics/dsx ios IPHONEOS_DEPLOYMENT_TARGET=26.0
+          make -C graphics/metal ios IPHONEOS_DEPLOYMENT_TARGET=26.0
+          make -C graphics/nvn ios IPHONEOS_DEPLOYMENT_TARGET=26.0
+          mkdir -p "$RUNNER_TEMP/out"
+          for f in build/dsx/ios/libdsx.a build/gal/ios/libnxgal.a build/nvn/ios/libnvn.a; do
+            test -s "$f"
+            xcrun lipo -info "$f"
+            xcrun ar -t "$f" | wc -l
+            cp "$f" "$RUNNER_TEMP/out/"
+          done
+          cp -R build/gal/ios/gal_helpers "$RUNNER_TEMP/out/"
+          cp graphics/metal/gal_abi.h graphics/dsx/dsx_abi.h "$RUNNER_TEMP/out/"
+          cp LICENSE NOTICE THIRD_PARTY_LICENSES.md "$RUNNER_TEMP/out/"
+          cp graphics/nvn/LICENSE "$RUNNER_TEMP/out/NVN-LICENSE"
+          cp graphics/third_party/spirv_cross/LICENSE "$RUNNER_TEMP/out/SPIRV-CROSS-LICENSE"
+          cp compat/tree/LICENSE.txt "$RUNNER_TEMP/out/RYUJINX-LICENSE"
+          git rev-parse HEAD > "$RUNNER_TEMP/out/upstream-commit.txt"
+          (cd "$RUNNER_TEMP/out"; shasum -a 256 *.a > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a19core-ios-graphics-libraries
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error
+  horizon:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: jhaizhou-ops/S2Arm
+          ref: 39d35671a57ee30d5f528c13d206fd6309a84b8f
+          path: upstream
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.402'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build Horizon services and Maxwell translator with NativeAOT
+        working-directory: upstream
+        run: |
+          set -euxo pipefail
+          printf '%s\n' '{"sdk":{"version":"10.0.402","rollForward":"disable","allowPrerelease":false}}' > global.json
+          export DOTNET="$DOTNET_ROOT/dotnet" S2A_CS_CACHE="$RUNNER_TEMP/aot"
+          test "$("$DOTNET" --version)" = 10.0.402
+          test -s compat/tree/src/Ryujinx.Graphics.Shader/Ryujinx.Graphics.Shader.csproj
+          test -s compat/tree/src/Ryujinx.HLE/Ryujinx.HLE.csproj
+          ls compat/packages/
+          mkdir -p "$RUNNER_TEMP/out"
+          bash services/nxaot.sh ios-arm64 | tee "$RUNNER_TEMP/out/linkflags-host.txt"
+          LIB=$(find "$S2A_CS_CACHE" -name libs2a_cs.a -type f | head -1)
+          test -s "$LIB"
+          xcrun lipo -info "$LIB"
+          xcrun nm -gU "$LIB" > "$RUNNER_TEMP/out/exports.txt"
+          grep ' _S2A_Init$' "$RUNNER_TEMP/out/exports.txt"
+          grep ' _s2a_dsh_compile$' "$RUNNER_TEMP/out/exports.txt"
+          cp "$LIB" "$RUNNER_TEMP/out/"
+          cp LICENSE NOTICE THIRD_PARTY_LICENSES.md "$RUNNER_TEMP/out/"
+          cp compat/tree/LICENSE.txt "$RUNNER_TEMP/out/RYUJINX-LICENSE"
+          git rev-parse HEAD > "$RUNNER_TEMP/out/upstream-commit.txt"
+          (cd "$RUNNER_TEMP/out"; shasum -a 256 *.a > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a19core-ios-horizon-and-shader-library
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error

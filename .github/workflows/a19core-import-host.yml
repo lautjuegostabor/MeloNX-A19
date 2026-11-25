@@ -1,0 +1,306 @@
+name: A19Core integrated NSP/XCI import and native host
+on:
+  workflow_dispatch:
+  push:
+    branches: [a19core-native-integration]
+    paths: ['a19core/converter/**', '.github/workflows/a19core-import-host.yml']
+permissions:
+  contents: read
+  statuses: write
+concurrency:
+  group: a19core-import-host
+  cancel-in-progress: true
+jobs:
+  host:
+    runs-on: xcode-27
+    timeout-minutes: 75
+    steps:
+      - name: Report start
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=pending -f context=a19core-import-host -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+      - uses: actions/checkout@v4
+        with:
+          path: project
+          sparse-checkout: |
+            a19core/native
+            a19core/converter
+      - uses: actions/checkout@v4
+        with:
+          repository: jhaizhou-ops/S2Arm
+          ref: 39d35671a57ee30d5f528c13d206fd6309a84b8f
+          path: upstream
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.402'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Configure pinned iOS toolchain
+        working-directory: upstream
+        run: |
+          set -euxo pipefail
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          for pair in gmake:make ninja:ninja meson:meson cmake:cmake; do
+            command -v "${pair%:*}" >/dev/null || brew install "${pair#*:}"
+          done
+          xcrun --find metal || xcodebuild -downloadComponent MetalToolchain
+          printf '%s\n' '{"sdk":{"version":"10.0.402","rollForward":"disable","allowPrerelease":false}}' > global.json
+          test "$("$DOTNET_ROOT/dotnet" --version)" = 10.0.402
+          # Change source toolchain default, NOT a command-line make variable:
+          # the previous build exported IPHONEOS_DEPLOYMENT_TARGET into host clang
+          # and tried to link the macOS gal_xc helper as an iOS binary.
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('tools/toolchain.env')
+          s=p.read_text().replace('IPHONEOS_DEPLOYMENT_TARGET=18.0','IPHONEOS_DEPLOYMENT_TARGET=26.0')
+          p.write_text(s)
+          PY
+      - name: Integrate A19Core native frontend, GPU policy and telemetry
+        working-directory: upstream
+        run: |
+          set -euxo pipefail
+          SRC="$GITHUB_WORKSPACE/project/a19core/native"
+          cp "$SRC/A19Library.m" "$SRC/a19_host.m" ios/
+          cp "$SRC/a19_policy.h" runtime/include/
+          cp "$SRC/a19_policy.c" runtime/src/
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('graphics/nvn/gfx/nvn/nvn_pso_budget.inc')
+          s=p.read_text()
+          needle='static int pb_warm_full(uint64_t built_unclaimed) {'
+          assert s.count(needle)==1
+          s=s.replace(needle,needle+'\n#if TARGET_OS_IPHONE\n    extern int a19_prewarm_should_stop(uint64_t);\n    if (a19_prewarm_should_stop(built_unclaimed + atomic_load(&g_pb_live_pub))) return 1;\n#endif')
+          p.write_text(s)
+          p=Path('runtime/src/qprompt_host.c');s=p.read_text()
+          needle='stretch_window(s2a_qp_game(), dt);'
+          assert s.count(needle)==1
+          s=s.replace('#include "native.h"','#include "native.h"\n#include <TargetConditionals.h>\n#if TARGET_OS_IPHONE\n#include "a19_policy.h"\n#endif')
+          s=s.replace(needle,needle+'\n#if TARGET_OS_IPHONE\n      a19_frame_observe(dt, s2a_qp_game(), video, cutscene);\n#endif\n      ')
+          p.write_text(s)
+          PY
+          # Policy check uses the same original C source linked into the real host.
+          xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -I"$SRC" "$SRC/a19_policy.c" "$SRC/policy_test.c" -o "$RUNNER_TEMP/policy-test"
+          "$RUNNER_TEMP/policy-test"
+      - name: Compile converter and integrate into the same NativeAOT image
+        working-directory: upstream
+        run: |
+          set -euxo pipefail
+          SRC="$GITHUB_WORKSPACE/project/a19core/converter"
+          PORT="$PWD/services/aot/A19Converter"
+          mkdir -p "$PORT"
+          cp pack/nx_unpack/*.cs "$PORT/"
+          cp "$SRC/"*.cs "$PORT/"
+          cp "$SRC/A19Import.m" ios/
+          python3 - "$PORT" <<'PY'
+          import pathlib,re,sys,subprocess,json,hashlib,xml.etree.ElementTree as ET
+          p=pathlib.Path(sys.argv[1]); f=p/'Program.cs'; s=f.read_text()
+          s,n=re.subn(r'static\s+int\s+Main\s*\(\s*string\[\]\s+a\s*\)', 'internal static int ConvertMain(string[] a)',s)
+          assert n==1
+          s=re.sub(r'Console\.OutputEncoding\s*=\s*[^;]+;', '',s)
+          f.write_text(s)
+          rf=p/'RomfsExtraction.cs'; rs=rf.read_text()
+          assert rs.count('const long ImageChunk = 8L << 20;')==1
+          rs=rs.replace('const long ImageChunk = 8L << 20;','const long ImageChunk = 4L << 20;')
+          assert rs.count('parallelism <= 0 ? Environment.ProcessorCount : parallelism')==2
+          rf.write_text(rs.replace('parallelism <= 0 ? Environment.ProcessorCount : parallelism','parallelism <= 0 ? Math.Min(2, Environment.ProcessorCount) : Math.Min(2, parallelism)'))
+          a=re.search(r'#define\s+S2A_HOST_ABI\s+(\d+)',pathlib.Path('runtime/include/s2a_host_abi.h').read_text()).group(1)
+          c=re.search(r'#define\s+DMSH_CHAIN\s+"([^"]+)"',pathlib.Path('graphics/nvn/gfx/nvn/dmsh_chain.h').read_text()).group(1)
+          raw=subprocess.check_output([sys.executable,'pack/rewriter.py','source'],text=True)
+          assert re.fullmatch(r'[0-9a-f]{64}',raw.strip())
+          rid=hashlib.sha256(raw.encode()).hexdigest()[:16]
+          (p/'GeneratedVersion.cs').write_text(f'internal static class GeneratedVersion {{ internal const int HostAbi={a}; internal const string Chain={json.dumps(c)}, Rewriter={json.dumps(rid)}; }}\n')
+          f=p/'ConvertJob.cs';s=f.read_text().replace('DllImport("__Internal",','DllImport("a19converter",');f.write_text(s)
+          f=pathlib.Path('services/aot/S2A.Aot.csproj');s=f.read_text()
+          assert s.count('</Project>')==1
+          f.write_text(s.replace('</Project>','<ItemGroup><PackageReference Include="ZstdSharp.Port" Version="0.8.8"/><DirectPInvoke Include="a19converter"/></ItemGroup></Project>'))
+          f=pathlib.Path('services/nuget.config');s=f.read_text()
+          s=s.replace('<package pattern="Ryujinx.LibHac" />','<package pattern="Ryujinx.LibHac" /><package pattern="ZstdSharp.Port" />')
+          f.write_text(s)
+          f=pathlib.Path('ios/A19Library.m');s=f.read_text()
+          s=s.replace('extern void s2a_shell_library_appeared(void);','extern void s2a_shell_library_appeared(void);\nextern int a19_import_busy(void);\nextern void a19_import_begin(UIViewController*);')
+          needle='UIStackView *s=[[UIStackView alloc] initWithArrangedSubviews:@[title,self.status,import,cert,row,self.table]]'
+          assert s.count(needle)==1
+          s=s.replace(needle,'UIButton *raw=[UIButton buttonWithType:UIButtonTypeSystem];[raw setTitle:@"Importar NSP / XCI" forState:UIControlStateNormal];[raw addTarget:self action:@selector(importRaw) forControlEvents:UIControlEventTouchUpInside];\n    UIStackView *s=[[UIStackView alloc] initWithArrangedSubviews:@[title,self.status,raw,import,cert,row,self.table]]')
+          s=s.replace('-(void)importProgram{','-(void)importRaw{if(isTarget())a19_import_begin(self);}\n-(void)importProgram{if(a19_import_busy())return;')
+          s=s.replace('[t deselectRowAtIndexPath:i animated:YES];NSDictionary*g=', '[t deselectRowAtIndexPath:i animated:YES];if(a19_import_busy())return;NSDictionary*g=')
+          f.write_text(s)
+          f=pathlib.Path('ios/app.m');s=f.read_text()
+          needle='static void library_play(const char *gid, void *ctx) {'
+          assert s.count(needle)==1
+          s=s.replace(needle,needle+'\n    extern int a19_import_busy(void); if (a19_import_busy()) return;\n')
+          f.write_text(s)
+          PY
+          python3 runtime/rewriter/prepare_deps.py build/rewriter-deps
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('build/rewriter-deps/capstone-5.0.7/src/CMakeLists.txt')
+          s=p.read_text();assert s.count('include(CPackConfig.txt)')==1
+          p.write_text(s.replace('include(CPackConfig.txt)','# CPack disabled for embedded iOS build'))
+          PY
+          cmake -S runtime/rewriter -B build/ios-rewriter -DS2A_REWRITER_DEPS="$PWD/build/rewriter-deps" -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/ios-rewriter --config Release --target s2a_rewriter --parallel 3
+          RW=$(find build/ios-rewriter -name libs2a_rewriter.a -print -quit);test -s "$RW"
+          LIBS=("$RW")
+          xcrun nm -gU "$RW" > build/rewriter-symbols.txt
+          if ! grep -Eq '[[:space:]]T[[:space:]]_cs_open
+        working-directory: upstream
+        run: |
+          set -euxo pipefail
+          unset IPHONEOS_DEPLOYMENT_TARGET
+          export S2A_DEVELOPER_DIR="$(xcode-select -p)"
+          export DOTNET="$DOTNET_ROOT/dotnet" S2A_CS_CACHE="$RUNNER_TEMP/aot"
+          # All real subsystems linked; no upstream Swift library UI and no game in build.
+          gmake -j3 ios S2A_CS=1 S2A_SHELLUI=0 IOS_BUNDLE=local.a19core.app IOS_DISPLAY=A19Core 2>&1 | tee "$RUNNER_TEMP/host-build.log"
+      - name: Package runnable native host (unsigned)
+        working-directory: upstream
+        run: |
+          set -euxo pipefail
+          APP="$PWD/build/ios/S2Arm.app"
+          test -s "$APP/S2Arm"
+          test -d build/gal/ios/gal_helpers
+          cp -R build/gal/ios/gal_helpers "$APP/"
+          cp -R build/a19-assets/systemdata build/a19-assets/fix "$APP/"
+          python - "$APP" <<'PY'
+          import hashlib,json,pathlib,plistlib,sys
+          app=pathlib.Path(sys.argv[1]); binary=app/'S2Arm'
+          shell_id=hashlib.sha256(binary.read_bytes()).hexdigest()[:16]
+          (app/'s2a_catalogue.json').write_text(json.dumps({'schema':1,'shell_id':shell_id,'games':[]}))
+          p=app/'Info.plist';d=plistlib.loads(p.read_bytes())
+          d['CFBundleName']='A19Core';d['CFBundleDisplayName']='A19Core';d['CFBundleIdentifier']='local.a19core.app'
+          d['CFBundleShortVersionString']='0.1';d['S2AShellId']=shell_id
+          d['S2ADisplayVersion']='A19Core native integration'
+          d['CFBundleURLTypes']=[{'CFBundleURLName':'a19core','CFBundleURLSchemes':['a19core']}]
+          # Keep existing package type for import interoperability, without claiming it is our own format.
+          p.write_bytes(plistlib.dumps(d))
+          PY
+          mkdir -p "$APP/A19Licenses"
+          cp LICENSE NOTICE THIRD_PARTY_LICENSES.md "$APP/A19Licenses/"
+          cp graphics/nvn/LICENSE "$APP/A19Licenses/NVN-LICENSE"
+          cp compat/tree/LICENSE.txt "$APP/A19Licenses/RYUJINX-LICENSE"
+          cp graphics/third_party/spirv_cross/LICENSE "$APP/A19Licenses/SPIRV-CROSS-LICENSE"
+          cp "$GITHUB_WORKSPACE/project/a19core/native/README.md" "$APP/A19Licenses/A19Core-Integration.md"
+          plutil -lint "$APP/Info.plist"
+          xcrun lipo -info "$APP/S2Arm"
+          xcrun nm -gU "$APP/S2Arm" > "$RUNNER_TEMP/linked-symbols.txt"
+          for sym in _a19_convert_game _converter_rewrite _a19_import_begin _a19_frame_observe _a19_prewarm_should_stop _s2a_shell_library_vc _S2A_InitSession _s2a_dsh_compile; do
+            grep " $sym$" "$RUNNER_TEMP/linked-symbols.txt"
+          done
+          mkdir -p "$RUNNER_TEMP/out/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/out/Payload/A19Core.app"
+          (cd "$RUNNER_TEMP/out"; zip -qry A19Core-import-unsigned.ipa Payload)
+          shasum -a 256 "$RUNNER_TEMP/out/A19Core-import-unsigned.ipa"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: A19Core-import-unsigned
+          path: ${{ runner.temp }}/out/A19Core-import-unsigned.ipa
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: A19Core-import-build-diagnostics
+          path: |
+            ${{ runner.temp }}/host-build.log
+            ${{ runner.temp }}/linked-symbols.txt
+          if-no-files-found: ignore
+      - name: Report outcome
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+        run: |
+          state=failure; [ "$RESULT" = success ] && state=success
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state="$state" -f context=a19core-import-host -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+ build/rewriter-symbols.txt; then
+            cmake --build build/ios-rewriter --config Release --target capstone_static --parallel 3
+            CAP=$(find build/ios-rewriter -name libcapstone.a -print -quit);test -s "$CAP";LIBS+=("$CAP")
+          fi
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=26.0 -I runtime/rewriter -c "$SRC/bridge.c" -o build/a19-converter-bridge.o
+          xcrun libtool -static -o build/liba19converter.a build/a19-converter-bridge.o "${LIBS[@]}"
+          printf '\nIOS_LIBS += $(CURDIR)/build/liba19converter.a\n' >> Makefile
+          # Open replacement system data, same recipe as the working standalone converter.
+          mkdir -p build/a19-assets/systemdata build/a19-assets/fix
+          find runtime/fix -maxdepth 1 -name '*.tsv' -exec cp {} build/a19-assets/fix/ \;
+          FONTENV="$RUNNER_TEMP/a19-fontenv"
+          python3 -m venv "$FONTENV"
+          "$FONTENV/bin/python" -m pip install -r pack/fonts/requirements.txt
+          "$FONTENV/bin/python" pack/fonts/make_open_fonts.py build/a19-assets/systemdata/fonts
+          export S2A_PYTHON="$FONTENV/bin/python"
+          if ! bash services/systemdata/make_tzdata.sh --check-sources; then bash services/systemdata/make_tzdata.sh --prepare-sources; fi
+          bash services/systemdata/make_tzdata.sh --check-sources
+          bash services/systemdata/make_tzdata.sh "$PWD/build/a19-assets/systemdata/010000000000080E"
+          for sid in 0100000000000802 0100000000000806 0100000000000823; do
+            python3 pack/sysdata_synth.py "$sid" "build/a19-assets/systemdata/$sid"
+            echo 'Generated by upstream S2Arm sysdata_synth.py' > "build/a19-assets/systemdata/$sid.synth"
+          done
+          test "$(find build/a19-assets/systemdata/fonts -name '*.bfttf' | wc -l | tr -d ' ')" = 7
+          test -f build/a19-assets/systemdata/010000000000080E/binaryList.txt
+      - name: Link complete ARM64 iOS native host
+        working-directory: upstream
+        run: |
+          set -euxo pipefail
+          unset IPHONEOS_DEPLOYMENT_TARGET
+          export S2A_DEVELOPER_DIR="$(xcode-select -p)"
+          export DOTNET="$DOTNET_ROOT/dotnet" S2A_CS_CACHE="$RUNNER_TEMP/aot"
+          # All real subsystems linked; no upstream Swift library UI and no game in build.
+          gmake -j3 ios S2A_CS=1 S2A_SHELLUI=0 IOS_BUNDLE=local.a19core.app IOS_DISPLAY=A19Core 2>&1 | tee "$RUNNER_TEMP/host-build.log"
+      - name: Package runnable native host (unsigned)
+        working-directory: upstream
+        run: |
+          set -euxo pipefail
+          APP="$PWD/build/ios/S2Arm.app"
+          test -s "$APP/S2Arm"
+          test -d build/gal/ios/gal_helpers
+          cp -R build/gal/ios/gal_helpers "$APP/"
+          python - "$APP" <<'PY'
+          import hashlib,json,pathlib,plistlib,sys
+          app=pathlib.Path(sys.argv[1]); binary=app/'S2Arm'
+          shell_id=hashlib.sha256(binary.read_bytes()).hexdigest()[:16]
+          (app/'s2a_catalogue.json').write_text(json.dumps({'schema':1,'shell_id':shell_id,'games':[]}))
+          p=app/'Info.plist';d=plistlib.loads(p.read_bytes())
+          d['CFBundleName']='A19Core';d['CFBundleDisplayName']='A19Core';d['CFBundleIdentifier']='local.a19core.app'
+          d['CFBundleShortVersionString']='0.1';d['S2AShellId']=shell_id
+          d['S2ADisplayVersion']='A19Core native integration'
+          d['CFBundleURLTypes']=[{'CFBundleURLName':'a19core','CFBundleURLSchemes':['a19core']}]
+          # Keep existing package type for import interoperability, without claiming it is our own format.
+          p.write_bytes(plistlib.dumps(d))
+          PY
+          mkdir -p "$APP/A19Licenses"
+          cp LICENSE NOTICE THIRD_PARTY_LICENSES.md "$APP/A19Licenses/"
+          cp graphics/nvn/LICENSE "$APP/A19Licenses/NVN-LICENSE"
+          cp compat/tree/LICENSE.txt "$APP/A19Licenses/RYUJINX-LICENSE"
+          cp graphics/third_party/spirv_cross/LICENSE "$APP/A19Licenses/SPIRV-CROSS-LICENSE"
+          cp "$GITHUB_WORKSPACE/project/a19core/native/README.md" "$APP/A19Licenses/A19Core-Integration.md"
+          plutil -lint "$APP/Info.plist"
+          xcrun lipo -info "$APP/S2Arm"
+          xcrun nm -gU "$APP/S2Arm" > "$RUNNER_TEMP/linked-symbols.txt"
+          for sym in _a19_frame_observe _a19_prewarm_should_stop _s2a_shell_library_vc _S2A_InitSession _s2a_dsh_compile; do
+            grep " $sym$" "$RUNNER_TEMP/linked-symbols.txt"
+          done
+          mkdir -p "$RUNNER_TEMP/out/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/out/Payload/A19Core.app"
+          (cd "$RUNNER_TEMP/out"; zip -qry A19Core-import-unsigned.ipa Payload)
+          shasum -a 256 "$RUNNER_TEMP/out/A19Core-import-unsigned.ipa"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: A19Core-import-unsigned
+          path: ${{ runner.temp }}/out/A19Core-import-unsigned.ipa
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: A19Core-import-build-diagnostics
+          path: |
+            ${{ runner.temp }}/host-build.log
+            ${{ runner.temp }}/linked-symbols.txt
+          if-no-files-found: ignore
+      - name: Report outcome
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+        run: |
+          state=failure; [ "$RESULT" = success ] && state=success
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state="$state" -f context=a19core-import-host -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

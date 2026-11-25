@@ -1,0 +1,161 @@
+name: A19Core v0.6 pipeline diagnostics
+on:
+  push:
+    branches: [a19core-native-integration]
+    paths:
+      - 'a19core/melonx/**'
+      - '.github/workflows/a19core-melonx-v06.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: a19core-melonx-v06
+  cancel-in-progress: false
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reconstruct and verify v0.6 telemetry
+        run: |
+          bash a19core/melonx/restore-v06.sh source --instrument
+          python3 a19core/melonx/check-telemetry.py source
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.402'
+      - name: Compile instrumented Vulkan backend on Linux
+        working-directory: source
+        run: dotnet build src/Ryujinx.Graphics.Vulkan/Ryujinx.Graphics.Vulkan.csproj -c Release
+
+  build:
+    needs: host
+    runs-on: xcode-27
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: source
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reconstruct v0.6 with versioned telemetry patch
+        working-directory: .
+        run: bash a19core/melonx/restore-v06.sh source --instrument
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: source/global.json
+      - name: Select Xcode 27 and tools
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
+          xcodebuild -version
+          command -v xcodegen >/dev/null || brew install xcodegen
+          sudo ln -sf "$(command -v dotnet)" /usr/local/bin/dotnet
+          if ! command -v rustup >/dev/null; then brew install rustup; fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Preflight reviewed sources and toolchain fingerprint
+        id: preflight
+        run: |
+          for f in src/MeloNX/MeloNX/Common/JIT/{MeloNXJITCoordinator,OnDevicePairing,MeloNXBuiltInJIT}.swift src/MeloNX/MeloNX/Core/RyujinxController.swift distribution/ios/a19/MeloNXJITHelper/MeloNXJITHelper.swift; do
+            xcrun swiftc -frontend -parse "$f"
+          done
+          xcrun swiftc -frontend -parse src/MeloNX/MeloNX/Common/A19Lab.swift
+          xcrun --sdk iphoneos clang -arch arm64 -fsyntax-only -std=c11 -miphoneos-version-min=15.0 src/MeloNX/MeloNX/Common/A19Bench.c
+          python3 -m py_compile distribution/ios/a19/validate-bundle.py
+          bash -n distribution/ios/a19/build-dependencies.sh
+          bash -n distribution/ios/a19/package.sh
+          echo "fingerprint=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; dotnet --version; rustc --version; uname -m; } | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Restore NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-a19-${{ runner.os }}-${{ hashFiles('source/global.json', 'source/**/*.csproj', 'source/**/Directory.Packages.props', 'source/nuget.config') }}
+      - name: Restore compiled native helpers
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            source/distribution/ios/a19/build/libhusk_rppairing.a
+            source/distribution/ios/a19/build/LICENSES-rppairing-crates.txt
+            source/distribution/ios/a19/build/StikJIT.framework
+            source/distribution/ios/a19/build/helper/Build/Products/Release-iphoneos/MeloNXJITHelper.appex
+          key: native-a19-v1-${{ steps.preflight.outputs.fingerprint }}-${{ hashFiles('source/distribution/ios/a19/vendor/**', 'source/distribution/ios/a19/MeloNXJITHelper/**', 'source/distribution/ios/a19/project.yml', 'source/distribution/ios/a19/build-dependencies.sh') }}
+      - name: Compile native pairing and StikJIT helper
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: distribution/ios/a19/build-dependencies.sh
+      - name: Validate native products
+        run: |
+          A=distribution/ios/a19/build
+          test -s "$A/LICENSES-rppairing-crates.txt"
+          test -s "$A/StikJIT.framework/universal.js"
+          lipo -verify_arch arm64 "$A/libhusk_rppairing.a"
+          lipo -verify_arch arm64 "$A/StikJIT.framework/StikJIT"
+          lipo -verify_arch arm64 "$A/helper/Build/Products/Release-iphoneos/MeloNXJITHelper.appex/MeloNXJITHelper"
+      - name: Save compiled native helpers before host build
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            source/distribution/ios/a19/build/libhusk_rppairing.a
+            source/distribution/ios/a19/build/LICENSES-rppairing-crates.txt
+            source/distribution/ios/a19/build/StikJIT.framework
+            source/distribution/ios/a19/build/helper/Build/Products/Release-iphoneos/MeloNXJITHelper.appex
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
+      - name: Restore compiled Ryujinx core
+        id: core-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: source/src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
+          key: core-a19core-v06-${{ steps.preflight.outputs.fingerprint }}-f925129209afd55927a0201d82285b8fa4b7ba30-${{ hashFiles('source/distribution/ios/build.sh', 'a19core/melonx/pipeline-telemetry.patch') }}
+      - name: Compile Ryujinx core if needed
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: distribution/ios/build.sh
+      - name: Validate core and mark ready for Xcode
+        run: |
+          lipo -verify_arch arm64 src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
+          nm -gU src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib > "$RUNNER_TEMP/a19-symbols.txt"
+          for symbol in a19_probe_enable a19_probe_options a19_probe_experiments a19_probe_frequency a19_probe_read; do
+            grep -q " _${symbol}$" "$RUNNER_TEMP/a19-symbols.txt" || { echo "Missing $symbol"; exit 1; }
+          done
+          touch .ci-core-cache-hit
+      - name: Save compiled core before host build
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: source/src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
+          key: ${{ steps.core-cache.outputs.cache-primary-key }}
+      - name: Archive MeloNX
+        run: |
+          xcodebuild archive -project src/MeloNX/MeloNX.xcodeproj -scheme MeloNX \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath build/MeloNX.xcarchive CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
+            SWIFT_OPTIMIZATION_LEVEL=-Onone
+      - name: Assemble and validate unsigned IPA
+        run: distribution/ios/a19/package.sh
+      - name: Record build provenance
+        run: |
+          {
+            printf 'candidate=%s\n' "$GITHUB_SHA"
+            printf 'baseline-workflow=%s\n' 1b9e58ae9c6d2714d7a022fe135cc32e2dc0f9c4
+            printf 'baseline-source=%s\n' "$(git rev-parse HEAD)"
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            dotnet --version
+            shasum -a 256 build/MeloNX-A19-unsigned.ipa
+          } > build/A19Core-build.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: A19Core-v06-pipeline-diagnostics-unsigned
+          path: |
+            source/build/MeloNX-A19-unsigned.ipa
+            source/build/A19Core-build.txt
+          if-no-files-found: error

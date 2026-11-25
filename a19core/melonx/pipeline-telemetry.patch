@@ -1,0 +1,245 @@
+--- a/src/Ryujinx.Common/A19Probe.cs
++++ b/src/Ryujinx.Common/A19Probe.cs
+@@ -7,7 +7,12 @@
+     // Cumulative counters; snapshots are deliberately non-blocking and approximate across threads.
+     public static class A19Probe
+     {
+-        public const int Count = 67;
++        public const int ForegroundPipelineCreateCalls = 67;
++        public const int ForegroundPipelineCreateTicks = 68;
++        public const int ForegroundPipelineLockTicks = 69;
++        public const int ForegroundProgramReadyCalls = 70;
++        public const int ForegroundProgramReadyTicks = 71;
++        public const int Count = 72;
+         // A19 reports 128-byte cache lines. 256-byte stride also prevents adjacent counters sharing a line.
+         private const int Stride = 32;
+         private static readonly long[] Values = new long[Count * Stride];
+@@ -42,6 +47,24 @@
+             Interlocked.Increment(ref Values[count * Stride]);
+             Interlocked.Add(ref Values[ticks * Stride], Stopwatch.GetTimestamp() - start);
+         }
++        public static void RecordPipelineCreate(long lockStart, long driverStart, long driverEnd)
++        {
++            if (driverStart == 0 || !Enabled)
++            {
++                return;
++            }
++
++            Interlocked.Increment(ref Values[23 * Stride]);
++            Interlocked.Add(ref Values[24 * Stride], driverEnd - driverStart);
++
++            if (lockStart != 0)
++            {
++                Interlocked.Increment(ref Values[ForegroundPipelineCreateCalls * Stride]);
++                Interlocked.Add(ref Values[ForegroundPipelineCreateTicks * Stride], driverEnd - driverStart);
++                Interlocked.Add(ref Values[ForegroundPipelineLockTicks * Stride], driverStart - lockStart);
++            }
++        }
++
+         public static void Frame(double seconds)
+         {
+             if (!Enabled || !double.IsFinite(seconds) || seconds <= 0 || seconds > 86400) return;
+--- a/src/Ryujinx.Graphics.Vulkan/PipelineState.cs
++++ b/src/Ryujinx.Graphics.Vulkan/PipelineState.cs
+@@ -2,6 +2,7 @@
+ using Silk.NET.Vulkan;
+ using Ryujinx.Common;
+ using System;
++using System.Diagnostics;
+ using System.Numerics;
+
+ namespace Ryujinx.Graphics.Vulkan
+@@ -350,7 +351,8 @@
+             PipelineCache cache,
+             bool allowSynchronousCompile = true,
+             bool throwOnError = true,
+-            bool cachePipelineFailure = true)
++            bool cachePipelineFailure = true,
++            bool foreground = false)
+         {
+             if (program.TryGetComputePipeline(ref SpecializationData, out Auto<DisposablePipeline> pipeline))
+             {
+@@ -394,12 +396,18 @@
+
+                 Result result;
+
++                long lockStart = foreground ? A19Probe.Start() : 0;
++                long pipelineStart;
++                long pipelineEnd;
++
+                 lock (gd.PipelineCreationLock)
+                 {
+-                    long pipelineStart = A19Probe.Start();
++                    pipelineStart = A19Probe.Start();
+                     result = gd.Api.CreateComputePipelines(device, cache, 1, &pipelineCreateInfo, null, &pipelineHandle);
+-                    A19Probe.End(pipelineStart, 23, 24);
+-                }
++                    pipelineEnd = pipelineStart != 0 ? Stopwatch.GetTimestamp() : 0;
++                }
++
++                A19Probe.RecordPipelineCreate(lockStart, pipelineStart, pipelineEnd);
+
+                 if (throwOnError)
+                 {
+@@ -429,7 +437,8 @@
+             RenderPass renderPass,
+             bool throwOnError = false,
+             bool allowSynchronousCompile = true,
+-            bool cachePipelineFailure = true)
++            bool cachePipelineFailure = true,
++            bool foreground = false)
+         {
+             if (program.TryGetGraphicsPipeline(ref Internal, out Auto<DisposablePipeline> pipeline))
+             {
+@@ -696,12 +705,18 @@
+
+                 Result result;
+
++                long lockStart = foreground ? A19Probe.Start() : 0;
++                long pipelineStart;
++                long pipelineEnd;
++
+                 lock (gd.PipelineCreationLock)
+                 {
+-                    long pipelineStart = A19Probe.Start();
++                    pipelineStart = A19Probe.Start();
+                     result = gd.Api.CreateGraphicsPipelines(device, cache, 1, &pipelineCreateInfo, null, &pipelineHandle);
+-                    A19Probe.End(pipelineStart, 23, 24);
+-                }
++                    pipelineEnd = pipelineStart != 0 ? Stopwatch.GetTimestamp() : 0;
++                }
++
++                A19Probe.RecordPipelineCreate(lockStart, pipelineStart, pipelineEnd);
+
+                 if (throwOnError)
+                 {
+--- a/src/Ryujinx.Graphics.Vulkan/PipelineBase.cs
++++ b/src/Ryujinx.Graphics.Vulkan/PipelineBase.cs
+@@ -1743,14 +1743,18 @@
+                     CreateRenderPass();
+                 }
+
+-                if (!_program.IsLinked)
++                long linkStart = _program.LinkStatus == ProgramLinkStatus.Incomplete ? A19Probe.Start() : 0;
++                bool linked = _program.IsLinked;
++                A19Probe.End(linkStart, A19Probe.ForegroundProgramReadyCalls, A19Probe.ForegroundProgramReadyTicks);
++
++                if (!linked)
+                 {
+                     return false;
+                 }
+
+                 Auto<DisposablePipeline> legacyPipeline = pbp == PipelineBindPoint.Compute
+-                    ? _newState.CreateComputePipeline(Gd, Device, _program, PipelineCache)
+-                    : _newState.CreateGraphicsPipeline(Gd, Device, _program, PipelineCache, _renderPass.Get(Cbs).Value);
++                    ? _newState.CreateComputePipeline(Gd, Device, _program, PipelineCache, foreground: true)
++                    : _newState.CreateGraphicsPipeline(Gd, Device, _program, PipelineCache, _renderPass.Get(Cbs).Value, foreground: true);
+
+                 if (legacyPipeline == null)
+                 {
+@@ -1808,7 +1812,7 @@
+                             return false;
+                         }
+
+-                        pipeline = _newState.CreateComputePipeline(Gd, Device, _program, PipelineCache);
++                        pipeline = _newState.CreateComputePipeline(Gd, Device, _program, PipelineCache, foreground: true);
+                     }
+                 }
+                 else
+@@ -1825,7 +1829,7 @@
+                             return false;
+                         }
+
+-                        pipeline = _newState.CreateGraphicsPipeline(Gd, Device, _program, PipelineCache, renderPass.Get(Cbs).Value);
++                        pipeline = _newState.CreateGraphicsPipeline(Gd, Device, _program, PipelineCache, renderPass.Get(Cbs).Value, foreground: true);
+                     }
+                 }
+
+@@ -1866,7 +1870,11 @@
+                 return true;
+             }
+
+-            if (!_program.TryGetInfos(out PipelineShaderStageCreateInfo[] stages, blocking))
++            long readyStart = blocking ? A19Probe.Start() : 0;
++            bool ready = _program.TryGetInfos(out PipelineShaderStageCreateInfo[] stages, blocking);
++            A19Probe.End(readyStart, A19Probe.ForegroundProgramReadyCalls, A19Probe.ForegroundProgramReadyTicks);
++
++            if (!ready)
+             {
+                 return false;
+             }
+--- a/src/MeloNX/MeloNX/Common/A19Lab.swift
++++ b/src/MeloNX/MeloNX/Common/A19Lab.swift
+@@ -24,7 +24,8 @@
+     "fence_wait_calls", "fence_wait_ticks", "queue_submit_calls", "queue_submit_ticks", "pipeline_create_calls", "pipeline_create_ticks", "mapped_upload_bytes", "mirror_upload_bytes", "background_compile_jobs", "background_compile_ticks",
+     "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes",
+     "mvk_statistics_result", "mvk_spirv_to_msl_count", "mvk_spirv_to_msl_avg_us", "mvk_msl_compile_count", "mvk_msl_compile_avg_us", "mvk_shader_cache_count", "mvk_shader_cache_avg_us", "mvk_pipeline_compile_count", "mvk_pipeline_compile_avg_us", "mvk_retrieve_command_count", "mvk_retrieve_command_avg_us", "mvk_encode_command_count", "mvk_encode_command_avg_us", "mvk_execute_command_count", "mvk_execute_command_avg_us", "mvk_gpu_memory_count", "mvk_gpu_memory_avg_kib_x1000",
+-    "jit_masked_index_fusions", "native_fp16_guest_ops", "tile_clear_passes", "retained_block_reuses", "retained_block_reuse_bytes", "qos_set_failures"
++    "jit_masked_index_fusions", "native_fp16_guest_ops", "tile_clear_passes", "retained_block_reuses", "retained_block_reuse_bytes", "qos_set_failures",
++    "foreground_pipeline_create_calls", "foreground_pipeline_create_ticks", "foreground_pipeline_lock_ticks", "foreground_program_ready_calls", "foreground_program_ready_ticks"
+ ]
+ private let a19Gauges = Set(29...35).union(44...60)
+
+@@ -137,7 +138,7 @@
+     private var gameStartSeconds: Double?
+     private var gameEndSeconds: Double?
+     private var gameExitCode: Int?
+-    private var previous = [Int64](repeating: 0, count: 67)
++    private var previous = [Int64](repeating: 0, count: a19Names.count)
+     private var started = 0.0
+     private var lastTime = 0.0
+     private var lastCpu: Int64 = -1
+@@ -195,7 +196,7 @@
+         }
+     }
+     private func read() -> [Int64]? {
+-        var result = [Int64](repeating: 0, count: 67)
++        var result = [Int64](repeating: 0, count: a19Names.count)
+         let count = result.withUnsafeMutableBufferPointer { a19Read($0.baseAddress!, Int32($0.count)) }
+         return count == Int32(result.count) ? result : nil
+     }
+@@ -259,7 +260,7 @@
+         writeReport()
+     }
+     private func writeReport() {
+-        let report = A19Report(schemaVersion: 2, build: "A19 Lab 0.6", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Native JSONL counters are cumulative except gauges at indices 29–35 and 44–60; export both files. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
++        let report = A19Report(schemaVersion: 3, build: "A19Core v0.6 pipeline diagnostics", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Native JSONL counters are cumulative except gauges at indices 29–35 and 44–60; export both files. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
+         do { let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]; try encoder.encode(report).write(to: destination, options: .atomic); reportURL = destination }
+         catch { status = "Report could not be saved." }
+     }
+--- a/src/MeloNX/MeloNX/Common/A19Bench.c
++++ b/src/MeloNX/MeloNX/Common/A19Bench.c
+@@ -84,6 +84,7 @@
+ #ifdef __APPLE__
+ #include <mach/mach.h>
+ #endif
++enum { A19_COUNTER_COUNT = 72 };
+ extern int32_t a19_probe_read(int64_t *, int32_t);
+ extern int64_t a19_probe_frequency(void);
+ static pthread_t trace_thread;
+@@ -107,13 +108,13 @@
+     double previous = start, previousWrite = 0;
+     int sequence = 0;
+     while (atomic_load(&trace_running) && sequence <= 600) {
+-        int64_t values[67];
++        int64_t values[A19_COUNTER_COUNT];
+         double now = ns();
+-        if (a19_probe_read(values, 67) != 67) { atomic_store(&trace_error, 2); break; }
++        if (a19_probe_read(values, A19_COUNTER_COUNT) != A19_COUNTER_COUNT) { atomic_store(&trace_error, 2); break; }
+         int64_t cpu = a19_cpu_time_us();
+         uint64_t footprint = trace_footprint(), available = a19_available_memory();
+         fprintf(f, "{\"type\":\"sample\",\"seq\":%d,\"elapsedSeconds\":%.6f,\"intervalSeconds\":%.6f,\"processCPUTimeUs\":%" PRId64 ",\"footprintBytes\":%" PRIu64 ",\"availableProcessBytes\":%" PRIu64 ",\"previousWriteMs\":%.3f,\"counters\":[", sequence, (now-start)/1e9, (now-previous)/1e9, cpu, footprint, available, previousWrite);
+-        for (int i = 0; i < 67; i++) fprintf(f, "%s%" PRId64, i ? "," : "", values[i]);
++        for (int i = 0; i < A19_COUNTER_COUNT; i++) fprintf(f, "%s%" PRId64, i ? "," : "", values[i]);
+         fputs("]}\n", f);
+         if (ferror(f) || !trace_flush(f)) { atomic_store(&trace_error, 3); break; }
+         previousWrite = (ns()-now)/1e6;
+@@ -137,7 +138,7 @@
+     atomic_store(&trace_count, 0); atomic_store(&trace_error, 0);
+     trace_file = fopen(path, "w");
+     if (!trace_file) return 0;
+-    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":2,\"build\":\"A19 Lab 0.6\",\"stopwatchFrequency\":%" PRId64 ",\"counterMode\":\"cumulative except gauges 29-35 and 44-60\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\",\"jit_masked_index_fusions\",\"native_fp16_guest_ops\",\"tile_clear_passes\",\"retained_block_reuses\",\"retained_block_reuse_bytes\",\"qos_set_failures\"]}\n", a19_probe_frequency());
++    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":3,\"build\":\"A19Core v0.6 pipeline diagnostics\",\"stopwatchFrequency\":%" PRId64 ",\"counterMode\":\"cumulative except gauges 29-35 and 44-60\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\",\"jit_masked_index_fusions\",\"native_fp16_guest_ops\",\"tile_clear_passes\",\"retained_block_reuses\",\"retained_block_reuse_bytes\",\"qos_set_failures\",\"foreground_pipeline_create_calls\",\"foreground_pipeline_create_ticks\",\"foreground_pipeline_lock_ticks\",\"foreground_program_ready_calls\",\"foreground_program_ready_ticks\"]}\n", a19_probe_frequency());
+     if (!trace_flush(trace_file)) { fclose(trace_file); return 0; }
+     atomic_store(&trace_running, 1);
+     if (pthread_create(&trace_thread, NULL, trace_worker, NULL) != 0) {

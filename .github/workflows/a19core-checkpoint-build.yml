@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: [a19core-native-integration]
-    paths: ['A19Core-source-transfer.txt', '.github/workflows/a19core-checkpoint-build.yml']
+    paths: ['A19Core-source-transfer.txt']
 permissions:
   contents: read
 concurrency:
@@ -13,6 +13,8 @@ jobs:
   build:
     runs-on: xcode-27
     timeout-minutes: 90
+    env:
+      A19_DOTNET_SDK: 10.0.402
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,7 +32,7 @@ jobs:
           path: upstream
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.402'
+          dotnet-version: ${{ env.A19_DOTNET_SDK }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -215,9 +217,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(dotnet --version)" = 10.0.402
+          export PATH="${DOTNET_ROOT:?setup-dotnet did not set DOTNET_ROOT}:$PATH"
+          test ! -e global.json || { echo "::error::Review the upstream global.json before updating the A19Core SDK pin"; exit 1; }
+          printf '{"sdk":{"version":"%s","rollForward":"disable"}}\n' "$A19_DOTNET_SDK" > global.json
+          command -v dotnet
+          dotnet --info
+          sdk_version="$(dotnet --version)"
+          if [[ "$sdk_version" != "$A19_DOTNET_SDK" ]]; then
+            echo "::error::Expected .NET SDK $A19_DOTNET_SDK, selected $sdk_version"
+            exit 1
+          fi
           unset S2A_APPLE_OS
-          export A19_PARITY_DIR="$(mktemp -d)"
+          A19_PARITY_DIR="$(mktemp -d)"
+          export A19_PARITY_DIR
+          trap 'rm -rf -- "$A19_PARITY_DIR"' EXIT
           python a19-tests/upstream-parity.py "$PWD" "$A19_PARITY_DIR"
           dotnet run --project a19-tests/ConverterTests.csproj -c Release
       - name: Prepare Apple Silicon and pinned dependencies

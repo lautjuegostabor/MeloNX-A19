@@ -1,4 +1,4 @@
-name: A19Core v0.6 pipeline diagnostics
+name: A19Core v0.6 Apple10 render candidate
 on:
   push:
     branches: [a19core-native-integration]
@@ -22,14 +22,15 @@ jobs:
           persist-credentials: false
       - name: Reconstruct and verify v0.6 telemetry
         run: |
-          bash a19core/melonx/restore-v06.sh source --instrument
-          python3 a19core/melonx/check-telemetry.py source
+          bash a19core/melonx/restore-v06.sh source --apple10
+          python3 a19core/melonx/check-telemetry.py source --schema 5
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.402'
-      - name: Compile instrumented Vulkan backend on Linux
-        working-directory: source
-        run: dotnet build src/Ryujinx.Graphics.Vulkan/Ryujinx.Graphics.Vulkan.csproj -c Release
+      - name: Compile Vulkan and exercise Apple10 readiness and attachments on Linux
+        run: |
+          dotnet run --project a19core/melonx/apple10-tests/Apple10.Tests.csproj -c Release \
+            -p:MeloNXSource="$GITHUB_WORKSPACE/source"
 
   build:
     needs: host
@@ -47,7 +48,7 @@ jobs:
           persist-credentials: false
       - name: Reconstruct v0.6 with versioned telemetry patch
         working-directory: .
-        run: bash a19core/melonx/restore-v06.sh source --instrument
+        run: bash a19core/melonx/restore-v06.sh source --apple10
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: source/global.json
@@ -114,7 +115,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: source/src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
-          key: core-a19core-v06-${{ steps.preflight.outputs.fingerprint }}-f925129209afd55927a0201d82285b8fa4b7ba30-${{ hashFiles('source/distribution/ios/build.sh', 'a19core/melonx/pipeline-telemetry.patch') }}
+          key: core-a19core-v06-${{ steps.preflight.outputs.fingerprint }}-f925129209afd55927a0201d82285b8fa4b7ba30-${{ hashFiles('source/distribution/ios/build.sh', 'a19core/melonx/*.patch') }}
       - name: Compile Ryujinx core if needed
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: distribution/ios/build.sh
@@ -154,7 +155,7 @@ jobs:
           } > build/A19Core-build.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: A19Core-v06-pipeline-diagnostics-unsigned
+          name: A19Core-v06-Apple10-render-unsigned
           path: |
             source/build/MeloNX-A19-unsigned.ipa
             source/build/A19Core-build.txt

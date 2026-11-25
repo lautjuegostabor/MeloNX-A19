@@ -38,6 +38,47 @@ stages = (PipelineShaderStageCreateInfo[])programType.GetMethod("GetInfos").Invo
 Expect(stages.Length == 1 && stages[0].Module.Handle == 0, "Failed module was published to the renderer.");
 Console.WriteLine("PASS Apple10 program readiness, completed stages and failure propagation");
 
+Type framebufferType = backend.GetType("Ryujinx.Graphics.Vulkan.FramebufferParams", throwOnError: true);
+MethodInfo matchesAttachments = framebufferType.GetMethod("HasSameLiveAttachments");
+Type viewType = backend.GetType("Ryujinx.Graphics.Vulkan.TextureView", throwOnError: true);
+ITexture color = CreateLiveView();
+ITexture otherColor = CreateLiveView();
+ITexture depth = CreateLiveView();
+object framebuffer = RuntimeHelpers.GetUninitializedObject(framebufferType);
+
+Array colors = Array.CreateInstance(viewType, 3);
+colors.SetValue(color, 0);
+colors.SetValue(otherColor, 2);
+Set(framebuffer, "_totalCount", colors.Length);
+Set(framebuffer, "_colorsCanonical", colors);
+Set(framebuffer, "_depthStencil", depth);
+
+var matches = matchesAttachments.CreateDelegate<MatchAttachments>(framebuffer);
+Expect(matches([color, null, otherColor], depth), "Identical live attachments were rejected.");
+Expect(!matches([otherColor, null, color], depth), "Reordered attachments were treated as identical.");
+Expect(!matches([color, otherColor, otherColor], depth), "New binding in empty slot was missed.");
+Expect(!matches([color, null], depth), "A changed color attachment count was missed.");
+Expect(!matches([color, null, otherColor], CreateLiveView()), "A replaced depth view was missed.");
+Expect(!matches([color, null, otherColor], null), "An unbound depth view was missed.");
+Set(otherColor, "_isValid", 0);
+Expect(!matches([color, null, otherColor], depth), "Disposed color view was accepted.");
+Set(otherColor, "_isValid", 1);
+Set(depth, "_isValid", 0);
+Expect(!matches([color, null, otherColor], depth), "Disposed depth view was accepted.");
+
+Type flushReason = backend.GetType("Ryujinx.Graphics.Vulkan.CommandFlushReason", throwOnError: true);
+Expect(Enum.GetValues(flushReason).Length ==
+    Ryujinx.Common.A19Probe.Count - Ryujinx.Common.A19Probe.FirstVulkanFlushReason,
+    "Flush reason count does not match the counter layout.");
+Console.WriteLine("PASS Apple10 attachment identity, validity and flush counter layout");
+
+ITexture CreateLiveView()
+{
+    object view = RuntimeHelpers.GetUninitializedObject(viewType);
+    Set(view, "_isValid", 1);
+    return (ITexture)view;
+}
+
 IProgram CreateProgram(object shaderModule)
 {
     object program = RuntimeHelpers.GetUninitializedObject(programType);
@@ -60,3 +101,5 @@ static void Expect(bool condition, string message)
         throw new InvalidOperationException(message);
     }
 }
+
+internal delegate bool MatchAttachments(ReadOnlySpan<ITexture> colors, ITexture depthStencil);

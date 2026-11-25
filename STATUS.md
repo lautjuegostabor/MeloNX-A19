@@ -5,8 +5,8 @@ El informe de investigación posterior revisa la elección de S2Arm del traspaso
 | Componente | Verificado en código | Probado en host Linux x86-64 | Compilado para iOS | Validado en iPhone 17 | Comparación controlada |
 |---|---|---|---|---|---|
 | MeloNX v0.6 de referencia | Fuente `f925129`, overlay SHA-256 fijado y cuatro parches de `1b9e58a` restaurados | Aplicación de los parches históricos | Build histórica según el traspaso | Juegos funcionales en el historial | Pendiente |
-| Candidato v0.6 instrumentado | Parche acotado a métricas de preparación de programas, lock y creación Vulkan | Backend Vulkan Release, prueba C de JSONL con core simulado y 72 contadores, acumulación C# concurrente | Pendiente de CI | Pendiente | Pendiente |
-| Candidato Apple10 con creación al primer uso | Opción para iPhone 17 base con `MTLDevice.supportsFamily(.apple10)`, desactivada por defecto | Backend Vulkan Release, enlace de módulos pendiente/listo/fallido y JSONL de 73 contadores | Pendiente | Pendiente | Pendiente |
+| Candidato v0.6 instrumentado | Parche acotado a métricas de preparación de programas, lock y creación Vulkan | Backend Vulkan Release, prueba C de JSONL con core simulado y 72 contadores, acumulación C# concurrente | [IPA ARM64 verificado](https://github.com/lautjuegostabor/MeloNX-A19/actions/runs/45621276570/artifacts/15024828336) | BOTW ejecutado y trazado. Cierre con fallo reportado | Pendiente |
+| Candidato Apple10 de render | Creación de pipelines al primer uso y conservación de pases compatibles. Opciones independientes, apagadas por defecto, para iPhone 17 base con `MTLDevice.supportsFamily(.apple10)` | Backend Vulkan Release, etapas de shader, identidad de attachments y JSONL de 84 contadores | Pendiente | Pendiente | Pendiente |
 | Checkpoint nativo `0100170` | Restauración con hashes desde S2Arm `39d35671` | Sintaxis de claves, extracción, IMG/USTAR, tabla de drivers y recuperación de paquete sintéticos | [IPA histórico](https://github.com/lautjuegostabor/MeloNX-A19/actions/runs/45578939713) | Flujo completo pendiente | Pendiente |
 | Checkpoint nativo `1f6c660` y gate actualizado | Restauración con hashes y selección exacta del SDK | Pruebas anteriores, paridad Mach-O normal/FAR/biased-dual, ejecutable de fixtures NativeAOT y DFS diferencial | [Falló el CI histórico](https://github.com/lautjuegostabor/MeloNX-A19/actions/runs/45579611946). Gate actualizado probado en Linux | Pendiente | Pendiente |
 
@@ -42,8 +42,13 @@ La captura de BOTW indica contención en el comienzo de la parte jugable. No cua
 
 ```sh
 bash a19core/melonx/restore-v06.sh ../melonx-apple10 --apple10
-python3 a19core/melonx/check-telemetry.py ../melonx-apple10 --schema 4
+python3 a19core/melonx/check-telemetry.py ../melonx-apple10 --schema 5
 dotnet run --project a19core/melonx/apple10-tests/Apple10.Tests.csproj -c Release -p:MeloNXSource="$(cd ../melonx-apple10 && pwd)"
 ```
 
 El fixture maneja objetos `ShaderCollection` del backend real con módulos simulados. Comprueba el contrato de preparación de etapas sin ejecutar Vulkan, Metal o un juego. El IPA de la ejecución 45621276570 es la referencia de diagnóstico anterior.
+
+
+**Apple10 reuse render pass** permite conservar el pase principal activo cuando se vuelven a configurar exactamente las mismas vistas vivas, en los mismos slots y con la misma vista de profundidad. Las actualizaciones de attachments filtradas por máscara conservan la ruta de recreación. Cuando cambian las vistas, se cierra el pase con el framebuffer anterior para registrar sus stores antes de cambiar los bindings. En la ruta reutilizada se vuelven a comprobar las barreras de los bindings antes del siguiente dibujo.
+
+El esquema 5 agrega contadores de pases conservados y pases terminados, y clasifica las llamadas a `FlushCommandsImpl` por motivo. Son contadores de solicitudes de flush del pipeline principal. Una solicitud puede enviar varios buffers, y hay envíos que provienen de otros caminos. El contador histórico `queue_submit_calls` sigue midiendo las llamadas Vulkan. BOTW registró cerca de 23 envíos por fotograma incluso en el tramo final sin compilación de pipelines. Esa traza precede al desglose y no establece qué fracción de esos envíos evitaba conservar el framebuffer. El fixture comprueba coincidencia de vistas vivas, slots vacíos, cambios de orden, cambios de profundidad y descarte de vistas inválidas con la clase real `FramebufferParams`. El efecto visual y el rendimiento en Apple10 requieren verificación física.

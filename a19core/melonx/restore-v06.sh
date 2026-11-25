@@ -59,6 +59,8 @@ if [[ -n "${2:-}" ]]; then
 fi
 
 if [[ "${2:-}" == "--apple10" ]]; then
-    git -C "$destination" apply --check "$script_dir/apple10-first-use-pipelines.patch"
-    git -C "$destination" apply "$script_dir/apple10-first-use-pipelines.patch"
+    for patch in apple10-first-use-pipelines apple10-render-pass; do
+        git -C "$destination" apply --check "$script_dir/$patch.patch"
+        git -C "$destination" apply "$script_dir/$patch.patch"
+    done
 fi

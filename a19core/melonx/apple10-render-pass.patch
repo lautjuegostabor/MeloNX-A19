@@ -1,0 +1,408 @@
+--- a/src/Ryujinx.Common/A19Probe.cs
++++ b/src/Ryujinx.Common/A19Probe.cs
+@@ -13,7 +13,10 @@
+         public const int ForegroundProgramReadyCalls = 70;
+         public const int ForegroundProgramReadyTicks = 71;
+         public const int DeferredApple10PipelineWarmups = 72;
+-        public const int Count = 73;
++        public const int Apple10RenderPassReuses = 73;
++        public const int VulkanRenderPassEnds = 74;
++        public const int FirstVulkanFlushReason = 75;
++        public const int Count = 84;
+         // A19 reports 128-byte cache lines. 256-byte stride also prevents adjacent counters sharing a line.
+         private const int Stride = 32;
+         private static readonly long[] Values = new long[Count * Stride];
+@@ -21,8 +24,9 @@
+         private static int _experiments, _nativeHalfSupported;
+         public static bool Experiment(int mask) => OperatingSystem.IsIOS() && (Volatile.Read(ref _experiments) & mask) != 0;
+         public static bool DeferApple10PipelineWarmup => Experiment(32);
++        public static bool KeepApple10RenderPass => Experiment(64);
+         public static bool NativeHalf => Experiment(2) && Volatile.Read(ref _nativeHalfSupported) != 0;
+-        public static void SetExperiments(int mask) => Volatile.Write(ref _experiments, mask & 63);
++        public static void SetExperiments(int mask) => Volatile.Write(ref _experiments, mask & 127);
+         public static void SetNativeHalfSupported(bool supported) => Volatile.Write(ref _nativeHalfSupported, supported ? 1 : 0);
+         public static bool Enabled => Volatile.Read(ref _enabled) != 0;
+         public static int ArgumentBuffers => Volatile.Read(ref _argumentBuffers);
+--- a/src/MeloNX/MeloNX/Common/A19Bench.c
++++ b/src/MeloNX/MeloNX/Common/A19Bench.c
+@@ -84,7 +84,7 @@
+ #ifdef __APPLE__
+ #include <mach/mach.h>
+ #endif
+-enum { A19_COUNTER_COUNT = 73 };
++enum { A19_COUNTER_COUNT = 84 };
+ extern int32_t a19_probe_read(int64_t *, int32_t);
+ extern int64_t a19_probe_frequency(void);
+ static pthread_t trace_thread;
+@@ -138,7 +138,7 @@
+     atomic_store(&trace_count, 0); atomic_store(&trace_error, 0);
+     trace_file = fopen(path, "w");
+     if (!trace_file) return 0;
+-    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":4,\"build\":\"A19Core v0.6 Apple10 first-use pipelines\",\"stopwatchFrequency\":%" PRId64 ",\"counterMode\":\"cumulative except gauges 29-35 and 44-60\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\",\"jit_masked_index_fusions\",\"native_fp16_guest_ops\",\"tile_clear_passes\",\"retained_block_reuses\",\"retained_block_reuse_bytes\",\"qos_set_failures\",\"foreground_pipeline_create_calls\",\"foreground_pipeline_create_ticks\",\"foreground_pipeline_lock_ticks\",\"foreground_program_ready_calls\",\"foreground_program_ready_ticks\",\"deferred_apple10_pipeline_warmups\"]}\n", a19_probe_frequency());
++    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":5,\"build\":\"A19Core v0.6 Apple10 render candidate\",\"stopwatchFrequency\":%" PRId64 ",\"counterMode\":\"cumulative except gauges 29-35 and 44-60\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\",\"jit_masked_index_fusions\",\"native_fp16_guest_ops\",\"tile_clear_passes\",\"retained_block_reuses\",\"retained_block_reuse_bytes\",\"qos_set_failures\",\"foreground_pipeline_create_calls\",\"foreground_pipeline_create_ticks\",\"foreground_pipeline_lock_ticks\",\"foreground_program_ready_calls\",\"foreground_program_ready_ticks\",\"deferred_apple10_pipeline_warmups\",\"apple10_render_pass_reuses\",\"vulkan_render_pass_ends\",\"vulkan_flush_draw\",\"vulkan_flush_attachment_change\",\"vulkan_flush_query\",\"vulkan_flush_resource_pressure\",\"vulkan_flush_present\",\"vulkan_flush_readback\",\"vulkan_flush_staging\",\"vulkan_flush_guest_sync\",\"vulkan_flush_helper\"]}\n", a19_probe_frequency());
+     if (!trace_flush(trace_file)) { fclose(trace_file); return 0; }
+     atomic_store(&trace_running, 1);
+     if (pthread_create(&trace_thread, NULL, trace_worker, NULL) != 0) {
+--- a/src/MeloNX/MeloNX/Common/A19Lab.swift
++++ b/src/MeloNX/MeloNX/Common/A19Lab.swift
+@@ -26,7 +26,8 @@
+     "mvk_statistics_result", "mvk_spirv_to_msl_count", "mvk_spirv_to_msl_avg_us", "mvk_msl_compile_count", "mvk_msl_compile_avg_us", "mvk_shader_cache_count", "mvk_shader_cache_avg_us", "mvk_pipeline_compile_count", "mvk_pipeline_compile_avg_us", "mvk_retrieve_command_count", "mvk_retrieve_command_avg_us", "mvk_encode_command_count", "mvk_encode_command_avg_us", "mvk_execute_command_count", "mvk_execute_command_avg_us", "mvk_gpu_memory_count", "mvk_gpu_memory_avg_kib_x1000",
+     "jit_masked_index_fusions", "native_fp16_guest_ops", "tile_clear_passes", "retained_block_reuses", "retained_block_reuse_bytes", "qos_set_failures",
+     "foreground_pipeline_create_calls", "foreground_pipeline_create_ticks", "foreground_pipeline_lock_ticks", "foreground_program_ready_calls", "foreground_program_ready_ticks",
+-    "deferred_apple10_pipeline_warmups"
++    "deferred_apple10_pipeline_warmups",
++    "apple10_render_pass_reuses", "vulkan_render_pass_ends", "vulkan_flush_draw", "vulkan_flush_attachment_change", "vulkan_flush_query", "vulkan_flush_resource_pressure", "vulkan_flush_present", "vulkan_flush_readback", "vulkan_flush_staging", "vulkan_flush_guest_sync", "vulkan_flush_helper"
+ ]
+ private let a19Gauges = Set(29...35).union(44...60)
+
+@@ -127,6 +128,7 @@
+     @Published var reuseBlocks = false
+     @Published var workerQoS = false
+     @Published var apple10PipelinesOnFirstUse = false
++    @Published var apple10KeepRenderPass = false
+     private(set) lazy var supportsApple10PipelinePolicy: Bool = {
+         if #available(iOS 26.0, *), UIDevice.modelName == "iPhone 17" {
+             return MTLCreateSystemDefaultDevice()?.supportsFamily(.apple10) == true
+@@ -135,8 +137,9 @@
+     }()
+     private var experimentMask: Int {
+         let apple10Policy = supportsApple10PipelinePolicy && apple10PipelinesOnFirstUse ? 32 : 0
++        let apple10RenderPass = supportsApple10PipelinePolicy && apple10KeepRenderPass ? 64 : 0
+         return (compactJIT ? 1 : 0) | (nativeFP16 ? 2 : 0) | (tileClear ? 4 : 0) |
+-            (reuseBlocks ? 8 : 0) | (workerQoS ? 16 : 0) | apple10Policy
++            (reuseBlocks ? 8 : 0) | (workerQoS ? 16 : 0) | apple10Policy | apple10RenderPass
+     }
+     private var task: Task<Void, Never>?
+     private var samples: [A19Sample] = []
+@@ -270,7 +273,7 @@
+         writeReport()
+     }
+     private func writeReport() {
+-        let report = A19Report(schemaVersion: 4, build: "A19Core v0.6 Apple10 first-use pipelines", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Native JSONL counters are cumulative except gauges at indices 29–35 and 44–60; export both files. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
++        let report = A19Report(schemaVersion: 5, build: "A19Core v0.6 Apple10 render candidate", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Native JSONL counters are cumulative except gauges at indices 29–35 and 44–60; export both files. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
+         do { let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]; try encoder.encode(report).write(to: destination, options: .atomic); reportURL = destination }
+         catch { status = "Report could not be saved." }
+     }
+@@ -296,6 +299,7 @@
+                 Toggle("Shader worker QoS", isOn: $lab.workerQoS)
+                 if lab.supportsApple10PipelinePolicy {
+                     Toggle("Apple10 pipelines on first use", isOn: $lab.apple10PipelinesOnFirstUse)
++                    Toggle("Apple10 reuse render pass", isOn: $lab.apple10KeepRenderPass)
+                 }
+                 Button("Apply for next game") { lab.apply() }
+             }.disabled(lab.running || lab.benchmarking)
+--- a/src/Ryujinx.Graphics.Vulkan/BufferHolder.cs
++++ b/src/Ryujinx.Graphics.Vulkan/BufferHolder.cs
+@@ -459,7 +459,7 @@
+
+             if (_gd.CommandBufferPool.OwnedByCurrentThread)
+             {
+-                _gd.FlushAllCommands();
++                _gd.FlushAllCommands(CommandFlushReason.Readback);
+
+                 result = resource.GetFlushBuffer().GetBufferData(_gd.CommandBufferPool, this, offset, size);
+             }
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Vulkan/CommandFlushReason.cs
+@@ -0,0 +1,15 @@
++namespace Ryujinx.Graphics.Vulkan
++{
++    enum CommandFlushReason
++    {
++        Draw,
++        AttachmentChange,
++        Query,
++        ResourcePressure,
++        Present,
++        Readback,
++        Staging,
++        GuestSync,
++        Helper,
++    }
++}
+--- a/src/Ryujinx.Graphics.Vulkan/FramebufferParams.cs
++++ b/src/Ryujinx.Graphics.Vulkan/FramebufferParams.cs
+@@ -326,6 +326,31 @@
+             return this;
+         }
+
++        public bool HasSameLiveAttachments(ReadOnlySpan<ITexture> colors, ITexture depthStencil)
++        {
++            if (colors.Length != _totalCount ||
++                (colors.Length != 0 && _colorsCanonical == null) ||
++                !IsSameLiveAttachment(_depthStencil, depthStencil))
++            {
++                return false;
++            }
++
++            for (int index = 0; index < colors.Length; index++)
++            {
++                if (!IsSameLiveAttachment(_colorsCanonical[index], colors[index]))
++                {
++                    return false;
++                }
++            }
++
++            return true;
++        }
++
++        private static bool IsSameLiveAttachment(TextureView current, ITexture requested)
++        {
++            return ReferenceEquals(current, requested) && (current == null || current.Valid);
++        }
++
+         public Auto<DisposableImageView> GetAttachment(int index)
+         {
+             if ((uint)index >= AttachmentsCount)
+--- a/src/Ryujinx.Graphics.Vulkan/HelperShader.cs
++++ b/src/Ryujinx.Graphics.Vulkan/HelperShader.cs
+@@ -239,7 +239,7 @@
+             bool linearFilter,
+             bool clearAlpha = false)
+         {
+-            gd.FlushAllCommands();
++            gd.FlushAllCommands(CommandFlushReason.Helper);
+
+             using CommandBufferScoped cbs = gd.CommandBufferPool.Rent();
+
+@@ -677,7 +677,7 @@
+         {
+             const int ClearColorBufferSize = 16;
+
+-            gd.FlushAllCommands();
++            gd.FlushAllCommands(CommandFlushReason.Helper);
+
+             using CommandBufferScoped cbs = gd.CommandBufferPool.Rent();
+
+@@ -739,7 +739,7 @@
+         {
+             const int ClearColorBufferSize = 16;
+
+-            gd.FlushAllCommands();
++            gd.FlushAllCommands(CommandFlushReason.Helper);
+
+             using CommandBufferScoped cbs = gd.CommandBufferPool.Rent();
+
+--- a/src/Ryujinx.Graphics.Vulkan/PipelineBase.cs
++++ b/src/Ryujinx.Graphics.Vulkan/PipelineBase.cs
+@@ -1077,10 +1077,17 @@
+
+         private void SetRenderTargetsInternal(Span<ITexture> colors, ITexture depthStencil, bool filterWriteMasked)
+         {
+-            CreateFramebuffer(colors, depthStencil, filterWriteMasked);
+-            CreateRenderPass();
++            bool framebufferChanged = UpdateFramebuffer(colors, depthStencil, filterWriteMasked);
++            if (framebufferChanged)
++            {
++                CreateRenderPass();
++            }
++
+             SignalStateChange();
+-            SignalAttachmentChange();
++            if (framebufferChanged)
++            {
++                SignalAttachmentChange();
++            }
+         }
+
+         public void SetRenderTargets(Span<ITexture> colors, ITexture depthStencil)
+@@ -1429,7 +1436,7 @@
+             _currentPipelineHandle = 0;
+         }
+
+-        private void CreateFramebuffer(Span<ITexture> colors, ITexture depthStencil, bool filterWriteMasked)
++        private bool UpdateFramebuffer(Span<ITexture> colors, ITexture depthStencil, bool filterWriteMasked)
+         {
+             if (filterWriteMasked)
+             {
+@@ -1488,6 +1495,23 @@
+                 }
+             }
+
++            if (RenderPassActive && IsMainPipeline && Gd.IsMoltenVk && Gd.IsTBDR && A19Probe.KeepApple10RenderPass)
++            {
++                if (!_framebufferUsingColorWriteMask &&
++                    FramebufferParams.AttachmentsCount != 0 &&
++                    FramebufferParams.HasSameLiveAttachments(colors, depthStencil))
++                {
++                    // The framebuffer and bound subresources are identical. Recheck binding
++                    // barriers before the next draw, as for a regular attachment update.
++                    _bindingBarriersDirty = true;
++                    A19Probe.Add(A19Probe.Apple10RenderPassReuses);
++                    return false;
++                }
++
++                // Record store usage against the old framebuffer before replacing its views.
++                EndRenderPass();
++            }
++
+             if (IsMainPipeline)
+             {
+                 FramebufferParams?.ClearBindings();
+@@ -1506,6 +1530,8 @@
+             _passWritesDepthStencil = false;
+             UpdatePassDepthStencil();
+             UpdatePipelineAttachmentFormats();
++
++            return true;
+         }
+
+         protected void UpdatePipelineAttachmentFormats()
+@@ -1666,7 +1692,7 @@
+
+             if (AutoFlush.ShouldFlushDraw(DrawCount))
+             {
+-                Gd.FlushAllCommands();
++                Gd.FlushAllCommands(CommandFlushReason.Draw);
+             }
+
+             DynamicState.ReplayIfDirty(Gd, CommandBuffer);
+@@ -1919,6 +1945,7 @@
+
+                 PauseTransformFeedbackInternal();
+                 Gd.Api.CmdEndRenderPass(CommandBuffer);
++                A19Probe.Add(A19Probe.VulkanRenderPassEnds);
+                 SignalRenderPassEnd();
+                 RenderPassActive = false;
+             }
+--- a/src/Ryujinx.Graphics.Vulkan/PipelineFull.cs
++++ b/src/Ryujinx.Graphics.Vulkan/PipelineFull.cs
+@@ -1,3 +1,4 @@
++using Ryujinx.Common;
+ using Ryujinx.Graphics.GAL;
+ using Ryujinx.Graphics.Vulkan.Queries;
+ using Silk.NET.Vulkan;
+@@ -191,7 +192,7 @@
+         {
+             if (AutoFlush.ShouldFlushQuery())
+             {
+-                FlushCommandsImpl();
++                FlushCommandsImpl(CommandFlushReason.Query);
+             }
+         }
+
+@@ -221,7 +222,7 @@
+
+                 if (_byteWeight >= MinByteWeightForFlush)
+                 {
+-                    FlushCommandsImpl();
++                    FlushCommandsImpl(CommandFlushReason.ResourcePressure);
+                 }
+             }
+         }
+@@ -241,8 +242,9 @@
+             }
+         }
+
+-        public void FlushCommandsImpl()
+-        {
++        public void FlushCommandsImpl(CommandFlushReason reason)
++        {
++            A19Probe.Add(A19Probe.FirstVulkanFlushReason + (int)reason);
+             AutoFlush.RegisterFlush(DrawCount);
+             EndRenderPass();
+
+@@ -331,7 +333,7 @@
+
+             if (AutoFlush.RegisterPendingQuery())
+             {
+-                FlushCommandsImpl();
++                FlushCommandsImpl(CommandFlushReason.Query);
+             }
+         }
+
+@@ -339,7 +341,7 @@
+         {
+             if (AutoFlush.ShouldFlushAttachmentChange(DrawCount))
+             {
+-                FlushCommandsImpl();
++                FlushCommandsImpl(CommandFlushReason.AttachmentChange);
+             }
+         }
+
+--- a/src/Ryujinx.Graphics.Vulkan/StagingBuffer.cs
++++ b/src/Ryujinx.Graphics.Vulkan/StagingBuffer.cs
+@@ -80,7 +80,7 @@
+                     {
+                         if (isRender)
+                         {
+-                            _gd.FlushAllCommands();
++                            _gd.FlushAllCommands(CommandFlushReason.Staging);
+                             scoped = cbp.Rent();
+                             isRender = false;
+                         }
+--- a/src/Ryujinx.Graphics.Vulkan/SyncManager.cs
++++ b/src/Ryujinx.Graphics.Vulkan/SyncManager.cs
+@@ -48,7 +48,7 @@
+             MultiFenceHolder waitable = new();
+             if (strict || _gd.InterruptAction == null)
+             {
+-                _gd.FlushAllCommands();
++                _gd.FlushAllCommands(CommandFlushReason.GuestSync);
+                 _gd.CommandBufferPool.AddWaitable(waitable);
+             }
+             else
+@@ -139,7 +139,7 @@
+                     {
+                         if (result.NeedsFlush(_flushId))
+                         {
+-                            _gd.FlushAllCommands();
++                            _gd.FlushAllCommands(CommandFlushReason.GuestSync);
+                         }
+                     });
+                 }
+--- a/src/Ryujinx.Graphics.Vulkan/TextureView.cs
++++ b/src/Ryujinx.Graphics.Vulkan/TextureView.cs
+@@ -634,7 +634,7 @@
+
+             if (_gd.CommandBufferPool.OwnedByCurrentThread)
+             {
+-                _gd.FlushAllCommands();
++                _gd.FlushAllCommands(CommandFlushReason.Readback);
+
+                 return PinnedSpan<byte>.UnsafeFromSpan(GetData(_gd.CommandBufferPool, resources.GetFlushBuffer()));
+             }
+@@ -648,7 +648,7 @@
+
+             if (_gd.CommandBufferPool.OwnedByCurrentThread)
+             {
+-                _gd.FlushAllCommands();
++                _gd.FlushAllCommands(CommandFlushReason.Readback);
+
+                 return PinnedSpan<byte>.UnsafeFromSpan(GetData(_gd.CommandBufferPool, resources.GetFlushBuffer(), layer, level));
+             }
+--- a/src/Ryujinx.Graphics.Vulkan/VulkanRenderer.cs
++++ b/src/Ryujinx.Graphics.Vulkan/VulkanRenderer.cs
+@@ -649,9 +649,9 @@
+             BufferManager.Delete(buffer);
+         }
+
+-        internal void FlushAllCommands()
+-        {
+-            _pipeline?.FlushCommandsImpl();
++        internal void FlushAllCommands(CommandFlushReason reason)
++        {
++            _pipeline?.FlushCommandsImpl(reason);
+         }
+
+         internal void RegisterFlush()
+--- a/src/Ryujinx.Graphics.Vulkan/Window.cs
++++ b/src/Ryujinx.Graphics.Vulkan/Window.cs
+@@ -342,7 +342,7 @@
+
+             Image swapchainImage = _swapchainImages[nextImage];
+
+-            _gd.FlushAllCommands();
++            _gd.FlushAllCommands(CommandFlushReason.Present);
+
+             CommandBufferScoped cbs = _gd.CommandBufferPool.Rent();
+
+@@ -396,7 +396,7 @@
+                         null,
+                         [PipelineStageFlags.ColorAttachmentOutputBit],
+                         null);
+-                    _gd.FlushAllCommands();
++                    _gd.FlushAllCommands(CommandFlushReason.Present);
+                     cbs.GetFence().Wait();
+                     cbs = _gd.CommandBufferPool.Rent();
+                 }

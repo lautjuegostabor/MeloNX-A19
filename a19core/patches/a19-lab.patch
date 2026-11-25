@@ -1,0 +1,764 @@
+--- /dev/null
++++ b/src/Ryujinx.Common/A19Probe.cs
+@@ -0,0 +1,49 @@
++using System;
++using System.Diagnostics;
++using System.Threading;
++
++namespace Ryujinx.Common
++{
++    // Cumulative counters; snapshots are deliberately non-blocking and approximate across threads.
++    public static class A19Probe
++    {
++        public const int Count = 44;
++        private static readonly long[] Values = new long[Count];
++        private static int _enabled, _argumentBuffers, _commandLimit, _shaderWorkers, _jitPadCalls;
++        public static bool Enabled => Volatile.Read(ref _enabled) != 0;
++        public static int ArgumentBuffers => Volatile.Read(ref _argumentBuffers);
++        public static int CommandLimit => Volatile.Read(ref _commandLimit);
++        public static int ShaderWorkers => Volatile.Read(ref _shaderWorkers);
++        public static int JitPadCalls => Volatile.Read(ref _jitPadCalls);
++        public static void Enable(int enabled) => Volatile.Write(ref _enabled, enabled);
++        public static void Options(int arg, int limit, int workers, int padCalls)
++        {
++            Volatile.Write(ref _argumentBuffers, arg is 1 or 2 ? arg : 0);
++            Volatile.Write(ref _commandLimit, limit is 32 or 64 or 128 ? limit : 0);
++            Volatile.Write(ref _shaderWorkers, workers is 1 or 2 ? workers : 0);
++            Volatile.Write(ref _jitPadCalls, padCalls is 4 or 8 or 16 ? padCalls : 0);
++        }
++        public static long Start() => Enabled ? Stopwatch.GetTimestamp() : 0;
++        public static void Add(int index, long amount = 1)
++        {
++            if (Enabled) Interlocked.Add(ref Values[index], amount);
++        }
++        public static void Set(int index, long value) => Interlocked.Exchange(ref Values[index], value);
++        public static void End(long start, int count, int ticks)
++        {
++            if (start == 0 || !Enabled) return;
++            Interlocked.Increment(ref Values[count]);
++            Interlocked.Add(ref Values[ticks], Stopwatch.GetTimestamp() - start);
++        }
++        public static void Frame(double seconds)
++        {
++            if (!Enabled || seconds <= 0 || seconds > 10) return;
++            long us = (long)(seconds * 1_000_000);
++            Interlocked.Increment(ref Values[0]);
++            Interlocked.Add(ref Values[1], us);
++            int bucket = us <= 8334 ? 2 : us <= 16667 ? 3 : us <= 33334 ? 4 : us <= 50000 ? 5 : us <= 100000 ? 6 : 7;
++            Interlocked.Increment(ref Values[bucket]);
++        }
++        public static long Read(int index) => Interlocked.Read(ref Values[index]);
++    }
++}
+--- a/src/Ryujinx.Library/Library.cs
++++ b/src/Ryujinx.Library/Library.cs
+@@ -70,6 +70,24 @@
+ {
+     class Library
+     {
++        [UnmanagedCallersOnly(EntryPoint = "a19_probe_enable")]
++        public static void A19ProbeEnable(int enabled) => global::Ryujinx.Common.A19Probe.Enable(enabled);
++
++        [UnmanagedCallersOnly(EntryPoint = "a19_probe_options")]
++        public static void A19ProbeOptions(int argumentBuffers, int commandLimit, int shaderWorkers, int jitPadCalls) =>
++            global::Ryujinx.Common.A19Probe.Options(argumentBuffers, commandLimit, shaderWorkers, jitPadCalls);
++
++        [UnmanagedCallersOnly(EntryPoint = "a19_probe_frequency")]
++        public static long A19ProbeFrequency() => System.Diagnostics.Stopwatch.Frequency;
++
++        [UnmanagedCallersOnly(EntryPoint = "a19_probe_read")]
++        public static unsafe int A19ProbeRead(long* output, int count)
++        {
++            if (output == null || count < global::Ryujinx.Common.A19Probe.Count) return 0;
++            for (int i = 0; i < global::Ryujinx.Common.A19Probe.Count; i++) output[i] = global::Ryujinx.Common.A19Probe.Read(i);
++            return global::Ryujinx.Common.A19Probe.Count;
++        }
++
+         private static VirtualFileSystem _virtualFileSystem;
+         private static ContentManager _contentManager;
+         private static AccountManager _accountManager;
+--- a/src/Ryujinx.HLE/PerformanceStatistics.cs
++++ b/src/Ryujinx.HLE/PerformanceStatistics.cs
+@@ -129,6 +129,11 @@
+             lock (_percentLock[percentType])
+             {
+                 _accumulatedActiveTime[percentType] += elapsedActiveTime;
++                if (_percentStartTime[percentType] > 0 && elapsedActiveTime >= 0)
++                {
++                    A19Probe.Add(36);
++                    A19Probe.Add(37, (long)(elapsedActiveTime * 1_000_000));
++                }
+                 _percentTime[percentType] += elapsedTime;
+             }
+ 
+@@ -141,6 +146,7 @@
+             double currentFrameTime = PerformanceCounter.ElapsedTicks * _ticksToSeconds;
+             double elapsedFrameTime = currentFrameTime - _previousFrameTime[frameType];
+ 
++            if (_previousFrameTime[frameType] > 0) A19Probe.Frame(elapsedFrameTime);
+             _previousFrameTime[frameType] = currentFrameTime;
+ 
+             lock (_frameLock[frameType])
+--- a/src/Ryujinx.Cpu/LightningJit/Translator.cs
++++ b/src/Ryujinx.Cpu/LightningJit/Translator.cs
+@@ -1,4 +1,5 @@
+ using ARMeilleure.Common;
++using Ryujinx.Common;
+ using ARMeilleure.Memory;
+ using Ryujinx.Memory;
+ using Ryujinx.Cpu.Jit;
+@@ -182,7 +183,12 @@
+ 
+         private CompiledFunction Compile(ulong address, ExecutionMode mode)
+         {
+-            return AarchCompiler.Compile(CpuPresets.CortexA57, Memory, address, FunctionTable, Stubs.DispatchStub, mode, RuntimeInformation.ProcessArchitecture);
++            long start = A19Probe.Start();
++            CompiledFunction compiled = AarchCompiler.Compile(CpuPresets.CortexA57, Memory, address, FunctionTable, Stubs.DispatchStub, mode, RuntimeInformation.ProcessArchitecture);
++            A19Probe.End(start, 8, 9);
++            A19Probe.Add(10, compiled.Code.Length);
++            A19Probe.Add(11, compiled.GuestCodeLength);
++            return compiled;
+         }
+ 
+         public void InvalidateJitCacheRegion(ulong address, ulong size)
+--- a/src/Ryujinx.Cpu/LightningJit/Cache/DualMappedNoWxCache.cs
++++ b/src/Ryujinx.Cpu/LightningJit/Cache/DualMappedNoWxCache.cs
+@@ -167,6 +167,7 @@
+                 if (!_pendingMap.Has(guestAddress))
+                 {
+                     int funcOffset = _sharedCache.Allocate(code.Length);
++                    A19Probe.Add(12, code.Length);
+ 
+                     funcPtr = _sharedCache.RwPointer + funcOffset;
+                     code.CopyTo(new Span<byte>((void*)funcPtr, code.Length));
+@@ -235,7 +236,8 @@
+ 
+             if (threadLocalCache != null && threadLocalCache.TryGetValue(guestAddress, out ThreadLocalCacheEntry entry))
+             {
+-                if (entry.IncrementUseCount() == MinCallsForPad)
++                int threshold = A19Probe.JitPadCalls;
++                if (entry.IncrementUseCount() == (threshold == 0 ? MinCallsForPad : threshold))
+                 {
+                     // Function is being called often, let's make it available in the shared cache so that the guest code
+                     // can take the fast path and stop calling the emulator to get the function from the thread local cache.
+@@ -243,7 +245,9 @@
+ 
+                     lock (_lock)
+                     {
++                        long start = A19Probe.Start();
+                         _pendingMap.Pad(_sharedCache.CacheAllocator);
++                        A19Probe.End(start, 15, 16);
+                     }
+                 }
+ 
+@@ -357,6 +361,8 @@
+         {
+             int alignedSize = BitUtils.AlignUp(code.Length, (int)MemoryBlock.GetPageSize());
+             int funcOffset = _localCache.Allocate(alignedSize);
++            A19Probe.Add(13, code.Length);
++            A19Probe.Add(14, alignedSize);
+ 
+             Debug.Assert((funcOffset & (int)(MemoryBlock.GetPageSize() - 1)) == 0);
+ 
+@@ -365,7 +371,9 @@
+             funcPtr = _localCache.RxPointer + funcOffset;
+             (_threadLocalCache ??= new()).Add(guestAddress, new(funcOffset, code.Length, funcPtr));
+ 
++            long flushStart = A19Probe.Start();
+             _localCache.SysIcacheInvalidate(funcOffset, alignedSize);
++            A19Probe.End(flushStart, 17, 18);
+ 
+             return funcPtr;
+         }
+--- a/src/Ryujinx.Graphics.Vulkan/CommandBufferPool.cs
++++ b/src/Ryujinx.Graphics.Vulkan/CommandBufferPool.cs
+@@ -1,4 +1,5 @@
+ using Silk.NET.Vulkan;
++using Ryujinx.Common;
+ using System;
+ using System.Collections.Generic;
+ using System.Diagnostics;
+@@ -311,7 +312,9 @@
+ 
+                         lock (_queueLock)
+                         {
++                            long submitStart = A19Probe.Start();
+                             _api.QueueSubmit(_queue, 1, in sInfo, entry.Fence.GetUnsafe()).ThrowOnError();
++                            A19Probe.End(submitStart, 21, 22);
+                         }
+                     }
+                 }
+@@ -328,7 +331,9 @@
+ 
+             if (entry.InConsumption)
+             {
++                long waitStart = A19Probe.Start();
+                 entry.Fence.Wait();
++                A19Probe.End(waitStart, 19, 20);
+                 entry.InConsumption = false;
+             }
+ 
+--- a/src/Ryujinx.Graphics.Vulkan/PipelineState.cs
++++ b/src/Ryujinx.Graphics.Vulkan/PipelineState.cs
+@@ -1,5 +1,6 @@
+ using Ryujinx.Common.Memory;
+ using Silk.NET.Vulkan;
++using Ryujinx.Common;
+ using System;
+ using System.Numerics;
+ 
+@@ -395,7 +396,9 @@
+ 
+                 lock (gd.PipelineCreationLock)
+                 {
++                    long pipelineStart = A19Probe.Start();
+                     result = gd.Api.CreateComputePipelines(device, cache, 1, &pipelineCreateInfo, null, &pipelineHandle);
++                    A19Probe.End(pipelineStart, 23, 24);
+                 }
+ 
+                 if (throwOnError)
+@@ -695,7 +698,9 @@
+ 
+                 lock (gd.PipelineCreationLock)
+                 {
++                    long pipelineStart = A19Probe.Start();
+                     result = gd.Api.CreateGraphicsPipelines(device, cache, 1, &pipelineCreateInfo, null, &pipelineHandle);
++                    A19Probe.End(pipelineStart, 23, 24);
+                 }
+ 
+                 if (throwOnError)
+--- a/src/Ryujinx.Graphics.Vulkan/BufferHolder.cs
++++ b/src/Ryujinx.Graphics.Vulkan/BufferHolder.cs
+@@ -1,5 +1,6 @@
+ using Ryujinx.Graphics.GAL;
+ using Silk.NET.Vulkan;
++using Ryujinx.Common;
+ using System;
+ using System.Collections.Generic;
+ using System.Runtime.CompilerServices;
+@@ -535,6 +536,7 @@
+                     WaitForFences(offset, dataSize);
+ 
+                     data[..dataSize].CopyTo(new Span<byte>((void*)(_map + offset), dataSize));
++                    A19Probe.Add(25, dataSize);
+ 
+                     if (_pendingData != null)
+                     {
+@@ -562,6 +564,7 @@
+                 }
+ 
+                 data[..dataSize].CopyTo(_pendingData.AsSpan(offset, dataSize));
++                A19Probe.Add(26, dataSize);
+                 _pendingDataRanges.Add(offset, dataSize);
+ 
+                 // Remove any overlapping mirrors.
+@@ -595,6 +598,7 @@
+                 data.Length > MaxUpdateBufferSize ||
+                 !TryPushData(cbs.Value, endRenderPass, offset, data))
+             {
++                A19Probe.Add(43, dataSize);
+                 if (allowCbsWait)
+                 {
+                     _gd.BufferManager.StagingBuffer.PushData(_gd.CommandBufferPool, cbs, endRenderPass, this, offset, data);
+--- a/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs
++++ b/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs
+@@ -1,4 +1,5 @@
+ using Silk.NET.Vulkan;
++using Ryujinx.Common;
+ using System;
+ using System.Collections.Generic;
+ using System.Threading;
+@@ -38,7 +39,11 @@
+             }
+ 
+             bool map = flags.HasFlag(MemoryPropertyFlags.HostVisibleBit);
+-            return Allocate(memoryTypeIndex, requirements.Size, requirements.Alignment, map, isBuffer);
++            long allocationStart = A19Probe.Start();
++            MemoryAllocation allocation = Allocate(memoryTypeIndex, requirements.Size, requirements.Alignment, map, isBuffer);
++            A19Probe.End(allocationStart, 40, 42);
++            A19Probe.Add(41, (long)Math.Min(requirements.Size, (ulong)long.MaxValue));
++            return allocation;
+         }
+ 
+         private MemoryAllocation Allocate(int memoryTypeIndex, ulong size, ulong alignment, bool map, bool isBuffer)
+--- a/src/Ryujinx.Graphics.Vulkan/BackgroundCompilationScheduler.cs
++++ b/src/Ryujinx.Graphics.Vulkan/BackgroundCompilationScheduler.cs
+@@ -1,4 +1,5 @@
+ using System;
++using Ryujinx.Common;
+ using System.Collections.Generic;
+ using System.Threading;
+ using System.Threading.Tasks;
+@@ -18,7 +19,10 @@
+ 
+         private static int GetBackgroundShaderCompileThreadCount()
+         {
+-            return Math.Max(1, Math.Min(2, Environment.ProcessorCount / 4));
++            int requested = A19Probe.ShaderWorkers;
++            int actual = requested != 0 && OperatingSystem.IsIOS() ? requested : Math.Max(1, Math.Min(2, Environment.ProcessorCount / 4));
++            A19Probe.Set(35, actual);
++            return actual;
+         }
+ 
+         public Task ScheduleShaderCompile(Action action, bool highPriority = false)
+@@ -149,7 +153,9 @@
+                         }
+                     }
+ 
++                    long workStart = A19Probe.Start();
+                     item.Execute();
++                    A19Probe.End(workStart, 27, 28);
+                 }
+             }
+ 
+--- a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
++++ b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
+@@ -1,4 +1,5 @@
+ using Silk.NET.Core.Loader;
++using Ryujinx.Common;
+ using Silk.NET.Vulkan;
+ using System;
+ using System.Runtime.InteropServices;
+@@ -13,16 +14,17 @@
+         private const string VulkanLib = "libvulkan.dylib";
+ 
+         [LibraryImport("libMoltenVK.dylib")]
+-        private static partial Result vkGetMoltenVKConfigurationMVK(nint unusedInstance, out MVKConfiguration config, in nint configSize);
++        private static partial Result vkGetMoltenVKConfigurationMVK(nint unusedInstance, out MVKConfiguration config, ref nint configSize);
+ 
+         [LibraryImport("libMoltenVK.dylib")]
+-        private static partial Result vkSetMoltenVKConfigurationMVK(nint unusedInstance, in MVKConfiguration config, in nint configSize);
++        private static partial Result vkSetMoltenVKConfigurationMVK(nint unusedInstance, in MVKConfiguration config, ref nint configSize);
+ 
+         public static void Initialize()
+         {
+             nint configSize = (nint)Marshal.SizeOf<MVKConfiguration>();
+ 
+-            vkGetMoltenVKConfigurationMVK(nint.Zero, out MVKConfiguration config, configSize);
++            Result getResult = vkGetMoltenVKConfigurationMVK(nint.Zero, out MVKConfiguration config, ref configSize);
++            A19Probe.Set(29, (int)getResult);
+ 
+             config.UseMetalArgumentBuffers = true;
+             config.FastMathEnabled = true;
+@@ -32,7 +34,20 @@
+ 
+             config.ResumeLostDevice = true;
+ 
+-            vkSetMoltenVKConfigurationMVK(nint.Zero, config, configSize);
++            if (OperatingSystem.IsIOS() && getResult == Result.Success)
++            {
++                if (A19Probe.ArgumentBuffers != 0) config.UseMetalArgumentBuffers = A19Probe.ArgumentBuffers == 1;
++                if (A19Probe.CommandLimit != 0) config.MaxActiveMetalCommandBuffersPerQueue = (uint)A19Probe.CommandLimit;
++            }
++            configSize = (nint)Marshal.SizeOf<MVKConfiguration>();
++            Result setResult = vkSetMoltenVKConfigurationMVK(nint.Zero, config, ref configSize);
++            A19Probe.Set(30, (int)setResult);
++            configSize = (nint)Marshal.SizeOf<MVKConfiguration>();
++            Result readResult = vkGetMoltenVKConfigurationMVK(nint.Zero, out MVKConfiguration actual, ref configSize);
++            A19Probe.Set(31, (int)readResult);
++            A19Probe.Set(32, readResult == Result.Success ? (actual.UseMetalArgumentBuffers ? 1 : 0) : -1);
++            A19Probe.Set(33, readResult == Result.Success ? actual.MaxActiveMetalCommandBuffersPerQueue : -1L);
++            A19Probe.Set(34, configSize.ToInt64());
+         }
+ 
+         private static string[] Resolver(string path)
+--- a/src/Ryujinx.Library/Window/WindowBase.cs
++++ b/src/Ryujinx.Library/Window/WindowBase.cs
+@@ -1,3 +1,4 @@
++using Ryujinx.Common;
+ using Ryujinx.Common.Configuration;
+ using Ryujinx.Common.Configuration.Hid;
+ using Ryujinx.Common.Logging;
+@@ -228,8 +229,10 @@
+                         Device.Statistics.RecordFifoEnd();
+                     }
+ 
++                    long presentStart = A19Probe.Start();
+                     if (Device.PresentLoop(SwapBuffers))
+                     {
++                        A19Probe.End(presentStart, 38, 39);
+                         if (!_ranFirstFrame)
+                         { 
+                             _ranFirstFrame = true;
+--- a/src/MeloNX/MeloNX/Core/RyujinxController.swift
++++ b/src/MeloNX/MeloNX/Core/RyujinxController.swift
+@@ -233,6 +233,7 @@
+         
+         settings.inputPath = game.fileURL.path
+         settings.backendThreading = .on
++        A19Lab.shared.gameWillStart(settings)
+         
+         isRunning = .started(game: game)
+         _isPaused = false
+@@ -249,6 +250,7 @@
+             let response = Ryujinx.mainRyu(settings)
+             
+             DispatchQueue.main.async {
++                A19Lab.shared.gameDidEnd(response)
+                 self.emulationThreadActive = false
+                 
+                 if response != 0 {
+--- a/src/MeloNX/MeloNX/UI/Main/Settings/SettingsView.swift
++++ b/src/MeloNX/MeloNX/UI/Main/Settings/SettingsView.swift
+@@ -774,6 +774,9 @@
+     
+     var advancedForm: some View {
+         Form {
++            Section("A19 Research") {
++                NavigationLink("Performance Lab") { A19LabView() }
++            }
+             Section("Debug Logging") {
+                 NativeToggleRow("Debug Logs", icon: "exclamationmark.bubble",
+                                 isOn: config.loggingEnableDebug,
+--- /dev/null
++++ b/src/MeloNX/MeloNX/Common/A19Lab.swift
+@@ -0,0 +1,269 @@
++import Foundation
++import SwiftUI
++import UIKit
++import Combine
++import Metal
++import Darwin
++
++@_silgen_name("a19_probe_enable") private func a19Enable(_ enabled: Int32)
++@_silgen_name("a19_probe_options") private func a19Options(_ argumentBuffers: Int32, _ commandLimit: Int32, _ shaderWorkers: Int32, _ jitPadCalls: Int32)
++@_silgen_name("a19_probe_frequency") private func a19Frequency() -> Int64
++@_silgen_name("a19_probe_read") private func a19Read(_ output: UnsafeMutablePointer<Int64>, _ count: Int32) -> Int32
++@_silgen_name("a19_cpu_benchmark") private nonisolated func a19CpuBench(_ output: UnsafeMutablePointer<Double>, _ count: Int32) -> Int32
++@_silgen_name("a19_cpu_time_us") private func a19CpuTime() -> Int64
++@_silgen_name("a19_available_memory") private func a19AvailableMemory() -> UInt64
++
++private let a19Names: [String] = [
++    "frames", "frame_interval_us", "frame_le_8_334ms", "frame_8_334_to_16_667ms", "frame_16_667_to_33_334ms", "frame_33_334_to_50ms", "frame_50_to_100ms", "frame_gt_100ms",
++    "jit_compiles", "jit_compile_ticks", "jit_host_code_bytes", "jit_guest_code_bytes", "jit_shared_copy_bytes", "jit_local_copy_bytes", "jit_local_page_bytes", "jit_pad_calls", "jit_pad_ticks", "jit_local_icache_calls", "jit_local_icache_ticks",
++    "fence_wait_calls", "fence_wait_ticks", "queue_submit_calls", "queue_submit_ticks", "pipeline_create_calls", "pipeline_create_ticks", "mapped_upload_bytes", "mirror_upload_bytes", "background_compile_jobs", "background_compile_ticks",
++    "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes"
++]
++private let a19Gauges = Set(29...35)
++
++private struct A19Sample: Codable {
++    let elapsedSeconds: Double
++    let intervalSeconds: Double
++    let thermalState: Int
++    let footprintBytes: UInt64?
++    let availableProcessBytes: UInt64
++    let processCPUTimeDeltaUs: Int64?
++    let counters: [String: Int64]
++}
++private struct A19Report: Codable {
++    let schemaVersion: Int
++    let build: String
++    let hardware: [String: String]
++    let settings: [String: Int]
++    let gameSettings: [String: String]
++    let gameStartSeconds: Double?
++    let gameEndSeconds: Double?
++    let gameExitCode: Int?
++    let stopwatchFrequency: Int64
++    let benchmarkHardware: [String: String]
++    let benchmarks: [String: Double]
++    let samples: [A19Sample]
++    let note: String
++    let benchmarkNotes: [String: String]
++}
++
++private nonisolated enum A19Hardware {
++    static func cpuBench() -> [String: Double] {
++        let names = ["latency_ns_16KiB", "latency_ns_64KiB", "latency_ns_256KiB", "latency_ns_1MiB", "latency_ns_4MiB", "latency_ns_8MiB", "latency_ns_16MiB", "latency_ns_32MiB", "memcpy_GBps_1MiB", "memcpy_GBps_32MiB", "atomic_relaxed_ns_single_thread"]
++        var values = [Double](repeating: -1, count: names.count)
++        let count = values.withUnsafeMutableBufferPointer { a19CpuBench($0.baseAddress!, Int32($0.count)) }
++        guard count == Int32(names.count) else { return [:] }
++        return Dictionary(uniqueKeysWithValues: zip(names, values).filter { $0.1.isFinite && $0.1 >= 0 })
++    }
++    static func gpuBench() -> [String: Double] {
++        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return [:] }
++        let source = """
++        #include <metal_stdlib>
++        using namespace metal;
++        kernel void f32(device float *out [[buffer(0)]], uint id [[thread_position_in_grid]]) {
++            float4 a = float4(float(id & 255u)*0.0001f+0.1f,0.2f,0.3f,0.4f);
++            float4 b = a+0.2f, c = a+0.3f, d = a+0.4f;
++            for(uint i=0;i<256;i++) { a=fma(a,float4(0.999f),float4(0.0001f)); b=fma(b,float4(0.998f),float4(0.0002f)); c=fma(c,float4(0.997f),float4(0.0003f)); d=fma(d,float4(0.996f),float4(0.0004f)); }
++            out[id]=dot(a+b+c+d,float4(1));
++        }
++        kernel void f16(device float *out [[buffer(0)]], uint id [[thread_position_in_grid]]) {
++            half4 a = half4(half(float(id & 255u)*0.0001f+0.1f),half(0.2f),half(0.3f),half(0.4f));
++            half4 b=a+half(0.2f), c=a+half(0.3f), d=a+half(0.4f);
++            for(uint i=0;i<256;i++) { a=fma(a,half4(0.999h),half4(0.0001h)); b=fma(b,half4(0.998h),half4(0.0002h)); c=fma(c,half4(0.997h),half4(0.0003h)); d=fma(d,half4(0.996h),half4(0.0004h)); }
++            out[id]=dot(float4(a+b+c+d),float4(1));
++        }
++        """
++        let options = MTLCompileOptions()
++        options.fastMathEnabled = false
++        guard let library = try? device.makeLibrary(source: source, options: options) else { return [:] }
++        let n = 65536
++        guard let output = device.makeBuffer(length: n*MemoryLayout<Float>.stride, options: .storageModeShared) else { return [:] }
++        var results: [String: Double] = [:]
++        for name in ["f32", "f16"] {
++            guard let function = library.makeFunction(name: name), let pipeline = try? device.makeComputePipelineState(function: function) else { continue }
++            var times: [Double] = []
++            for iteration in 0..<4 {
++                guard let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else { break }
++                encoder.setComputePipelineState(pipeline)
++                encoder.setBuffer(output, offset: 0, index: 0)
++                let width = max(1, min(pipeline.maxTotalThreadsPerThreadgroup, pipeline.threadExecutionWidth*4))
++                encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
++                encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
++                guard command.status == .completed, command.gpuEndTime > command.gpuStartTime else { continue }
++                let value = output.contents().assumingMemoryBound(to: Float.self)[n-1]
++                guard value.isFinite && value > 0 else { continue }
++                if iteration > 0 { times.append((command.gpuEndTime-command.gpuStartTime)*1000) }
++            }
++            if !times.isEmpty { results["metal_\(name)_median_ms"] = times.sorted()[times.count/2] }
++        }
++        return results
++    }
++}
++
++@MainActor final class A19Lab: ObservableObject {
++    static let shared = A19Lab()
++    @Published private(set) var running = false
++    @Published private(set) var benchmarking = false
++    @Published private(set) var sampleCount = 0
++    @Published private(set) var reportURL: URL?
++    @Published private(set) var status = "Ready"
++    @Published var argumentBuffers = 0
++    @Published var commandLimit = 0
++    @Published var shaderWorkers = 0
++    @Published var jitPadCalls = 0
++    private var task: Task<Void, Never>?
++    private var samples: [A19Sample] = []
++    private var benchmarks: [String: Double] = [:]
++    private var benchmarkHardware: [String: String] = [:]
++    private var hardware: [String: String] = [:]
++    private var selected: [String: Int] = [:]
++    private var gameSettings: [String: String] = [:]
++    private var gameStartSeconds: Double?
++    private var gameEndSeconds: Double?
++    private var gameExitCode: Int?
++    private var previous = [Int64](repeating: 0, count: 44)
++    private var started = 0.0
++    private var lastTime = 0.0
++    private var lastCpu: Int64 = -1
++    private let reportName = "MeloNX-A19-research.json"
++    private var destination: URL {
++        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(reportName)
++    }
++    init() {
++        if FileManager.default.fileExists(atPath: destination.path) { reportURL = destination }
++    }
++    func apply() {
++        guard !running && !benchmarking else { return }
++        a19Options(Int32(argumentBuffers), Int32(commandLimit), Int32(shaderWorkers), Int32(jitPadCalls))
++        status = "Options applied for next game."
++    }
++    private func metadata() -> [String: String] {
++        let info = ProcessInfo.processInfo
++        var result = ["model": UIDevice.modelName, "os": UIDevice.current.systemVersion,
++                      "physicalMemoryBytes": String(info.physicalMemory), "processorCount": String(info.processorCount),
++                      "activeProcessorCount": String(info.activeProcessorCount), "pageBytes": String(getpagesize()),
++                      "thermalAtStart": String(info.thermalState.rawValue)]
++        if let device = MTLCreateSystemDefaultDevice() {
++            result["metalDevice"] = device.name
++            result["metalArgumentBuffersTierRaw"] = String(device.argumentBuffersSupport.rawValue)
++            result["metalMaxBufferLength"] = String(device.maxBufferLength)
++            result["metalCounterSets"] = device.counterSets?.map(\.name).joined(separator: ",") ?? "unavailable"
++        }
++        for key in ["hw.cachelinesize", "hw.l1icachesize", "hw.l1dcachesize", "hw.l2cachesize", "hw.l3cachesize", "hw.optional.arm.FEAT_LSE", "hw.optional.arm.FEAT_LRCPC", "hw.optional.arm.FEAT_FP16", "hw.optional.arm.FEAT_DotProd", "hw.optional.arm.FEAT_MOPS"] {
++            var value: UInt64 = 0; var size = MemoryLayout<UInt64>.size
++            let code = key.withCString { sysctlbyname($0, &value, &size, nil, 0) }
++            if code == 0 { result[key] = String(value) }
++        }
++        return result
++    }
++    func benchmark() {
++        guard !running && !benchmarking && !RyujinxController.shared.isRunning.isRunning() else { return }
++        benchmarking = true; status = "Measuring CPU and Metal…"; hardware = metadata()
++        Task {
++            let values = await Task.detached(priority: .userInitiated) {
++                var data = A19Hardware.cpuBench()
++                data.merge(A19Hardware.gpuBench()) { _,new in new }
++                return data
++            }.value
++            benchmarks = values
++            hardware["thermalAfterBenchmark"] = String(ProcessInfo.processInfo.thermalState.rawValue)
++            benchmarkHardware = hardware
++            benchmarking = false; status = "Benchmark finished: \(values.count) measurements."
++            selected = ["argumentBuffers":argumentBuffers,"commandLimit":commandLimit,"shaderWorkers":shaderWorkers,"jitPadCalls":jitPadCalls]
++            samples = []; sampleCount = 0; gameSettings = [:]; gameStartSeconds = nil; gameEndSeconds = nil; gameExitCode = nil; writeReport()
++        }
++    }
++    private func read() -> [Int64]? {
++        var result = [Int64](repeating: 0, count: 44)
++        let count = result.withUnsafeMutableBufferPointer { a19Read($0.baseAddress!, Int32($0.count)) }
++        return count == Int32(result.count) ? result : nil
++    }
++    private func footprint() -> UInt64? {
++        var value = task_vm_info_data_t()
++        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.stride)/4
++        let code = withUnsafeMutablePointer(to: &value) { p in
++            p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
++        }
++        return code == KERN_SUCCESS ? value.phys_footprint : nil
++    }
++    func gameWillStart(_ settings: Options) {
++        guard running else { return }
++        gameStartSeconds = ProcessInfo.processInfo.systemUptime-started
++        gameSettings = ["resolutionScale": String(settings.resScale), "docked": String(!settings.disableDockedMode), "vsyncDisabled": String(settings.disableVSync), "shaderCacheDisabled": String(settings.disableShaderCache), "asyncShaders": String(settings.enableAsyncShaderCompilation), "memoryManager": String(settings.memoryManagerMode.rawValue), "textureRecompression": String(settings.enableTextureRecompression), "expandRAM": String(settings.expandRAM)]
++        writeReport()
++    }
++    func gameDidEnd(_ exitCode: Int) {
++        guard running else { return }
++        gameEndSeconds = ProcessInfo.processInfo.systemUptime-started
++        gameExitCode = exitCode
++        stop()
++    }
++    func start() {
++        guard !running && !benchmarking else { return }
++        guard let initial = read() else { status = "Core telemetry ABI unavailable."; return }
++        apply(); previous = initial; hardware = metadata(); samples = []; sampleCount = 0
++        gameSettings = [:]; gameStartSeconds = nil; gameEndSeconds = nil; gameExitCode = nil
++        selected = ["argumentBuffers":argumentBuffers,"commandLimit":commandLimit,"shaderWorkers":shaderWorkers,"jitPadCalls":jitPadCalls]
++        started = ProcessInfo.processInfo.systemUptime; lastTime = started; lastCpu = a19CpuTime()
++        running = true; a19Enable(1); status = "Capture active. Start a controlled test."
++        writeReport()
++        task = Task { [weak self] in
++            while !Task.isCancelled {
++                try? await Task.sleep(nanoseconds: 1_000_000_000)
++                guard !Task.isCancelled, let self, self.running else { break }
++                self.sample()
++                if self.samples.count >= 600 { self.stop(); break }
++            }
++        }
++    }
++    private func sample() {
++        guard let current = read() else { return }
++        let now = ProcessInfo.processInfo.systemUptime; let cpu = a19CpuTime()
++        var counters: [String: Int64] = [:]
++        for i in current.indices { counters[a19Names[i]] = a19Gauges.contains(i) ? current[i] : max(0,current[i]-previous[i]) }
++        samples.append(A19Sample(elapsedSeconds: now-started, intervalSeconds: now-lastTime, thermalState: ProcessInfo.processInfo.thermalState.rawValue, footprintBytes: footprint(), availableProcessBytes: a19AvailableMemory(), processCPUTimeDeltaUs: cpu >= lastCpu && lastCpu >= 0 ? cpu-lastCpu : nil, counters: counters))
++        previous = current; lastTime = now; lastCpu = cpu; sampleCount = samples.count
++        if sampleCount % 10 == 0 { writeReport() }
++    }
++    func stop() {
++        guard running else { return }
++        if samples.count < 600 { sample() }; running = false; a19Enable(0); task?.cancel(); task = nil
++        status = "Capture stopped: \(sampleCount) samples."; writeReport()
++    }
++    private func writeReport() {
++        let report = A19Report(schemaVersion: 1, build: "A19 Lab 0.4", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Counters are interval deltas except MVK and shader worker gauges. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
++        do { let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]; try encoder.encode(report).write(to: destination, options: .atomic); reportURL = destination }
++        catch { status = "Report could not be saved." }
++    }
++}
++
++struct A19LabView: View {
++    @ObservedObject private var lab = A19Lab.shared
++    var body: some View {
++        Form {
++            Section("Hardware research") {
++                Button("Run CPU + Metal benchmarks") { lab.benchmark() }.disabled(lab.running || lab.benchmarking)
++                Text("Run without a game active. CPU cache-latency sweep, memory copies, atomic operation and Metal FP16/FP32 tests.").font(.caption)
++            }
++            Section("Controlled experiment — next game") {
++                Picker("Argument buffers", selection: $lab.argumentBuffers) { Text("Original").tag(0); Text("Force on").tag(1); Text("Force off").tag(2) }
++                Picker("Metal command limit", selection: $lab.commandLimit) { Text("Original").tag(0); Text("32").tag(32); Text("64").tag(64); Text("128").tag(128) }
++                Picker("Shader workers", selection: $lab.shaderWorkers) { Text("Original").tag(0); Text("1").tag(1); Text("2").tag(2) }
++                Picker("JIT promotion threshold", selection: $lab.jitPadCalls) { Text("Original (8)").tag(0); Text("4").tag(4); Text("8").tag(8); Text("16").tag(16) }
++                Button("Apply for next game") { lab.apply() }
++            }.disabled(lab.running || lab.benchmarking)
++            Section("Core trace") {
++                if lab.running { Button("Stop and save trace") { lab.stop() } }
++                else { Button("Start trace") { lab.start() }.disabled(lab.benchmarking) }
++                Text("Samples: \(lab.sampleCount) / 600. Saves every 10 samples to the app’s Files folder.").font(.caption)
++            }
++            Section("Export") {
++                if let url = lab.reportURL {
++                    if #available(iOS 16.0, *) { ShareLink(item: url) { Label("Share research JSON", systemImage: "square.and.arrow.up") } }
++                    else { Text("Report saved in Files: \(url.lastPathComponent)") }
++                }
++                Text(lab.status).font(.caption)
++            }
++        }.navigationTitle("A19 Performance Lab")
++    }
++}
+--- /dev/null
++++ b/src/MeloNX/MeloNX/Common/A19Bench.c
+@@ -0,0 +1,77 @@
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <stdatomic.h>
++#include <sys/resource.h>
++#ifdef __APPLE__
++#include <os/proc.h>
++#include <mach/mach_time.h>
++#endif
++#if defined(__aarch64__)
++#include <arm_neon.h>
++#endif
++static volatile uint64_t a19_sink;
++static double ns(void) {
++#ifdef __APPLE__
++    mach_timebase_info_data_t tb;
++    mach_timebase_info(&tb);
++    return (double)mach_continuous_time()*tb.numer/tb.denom;
++#else
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec*1e9+ts.tv_nsec;
++#endif
++}
++static uint32_t rng(uint32_t *s) { *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5; return *s; }
++static double latency(size_t bytes) {
++    uint32_t n=(uint32_t)(bytes/64);
++    uint32_t *order=malloc((size_t)n*sizeof(*order));
++    uint32_t *mem=malloc(bytes);
++    if (!order || !mem) { free(order); free(mem); return -1; }
++    for(uint32_t i=0;i<n;i++) order[i]=i;
++    uint32_t seed=0x19a19a19;
++    for(uint32_t i=n-1;i>0;i--) { uint32_t j=rng(&seed)%(i+1); uint32_t a=order[i];order[i]=order[j];order[j]=a; }
++    for(uint32_t i=0;i<n;i++) mem[16*order[i]]=16*order[(i+1)%n];
++    uint32_t idx=16*order[0];
++    volatile uint32_t *v=mem;
++    for(uint32_t i=0;i<n;i++) idx=v[idx];
++    const uint32_t loops=2000000;
++    double start=ns();
++    for(uint32_t i=0;i<loops;i++) idx=v[idx];
++    double time=ns()-start; a19_sink=idx;
++    free(order);free(mem);return time/loops;
++}
++static double bandwidth(size_t bytes) {
++    uint8_t *a=malloc(bytes),*b=malloc(bytes);
++    if(!a||!b){ free(a);free(b);return -1; }
++    memset(a,0x39,bytes);memset(b,0,bytes);
++    void *(*volatile cp)(void *,const void *,size_t)=memcpy;
++    cp(b,a,bytes);
++    const int reps=16;
++    double start=ns();
++    for(int i=0;i<reps;i++){cp(b,a,bytes);a19_sink+=b[(size_t)i*4096%bytes];}
++    double time=ns()-start; free(a);free(b);
++    return time>0 ? (double)bytes*reps/time : -1; // GB/s copied, not bus traffic
++}
++static double atomic_ns(void) {
++    _Atomic uint64_t v=0; const int reps=2000000;
++    double start=ns();for(int i=0;i<reps;i++) atomic_fetch_add_explicit(&v,1,memory_order_relaxed);
++    double time=ns()-start;a19_sink=atomic_load(&v);return time/reps;
++}
++int32_t a19_cpu_benchmark(double *out,int32_t count) {
++    if(!out||count<11)return 0;
++    const size_t sizes[]={16384,65536,262144,1048576,4194304,8388608,16777216,33554432};
++    for(int i=0;i<8;i++)out[i]=latency(sizes[i]);
++    out[8]=bandwidth(1024*1024);out[9]=bandwidth(32*1024*1024);out[10]=atomic_ns();return 11;
++}
++int64_t a19_cpu_time_us(void) {
++    struct rusage r;if(getrusage(RUSAGE_SELF,&r)!=0)return -1;
++    return ((int64_t)r.ru_utime.tv_sec+r.ru_stime.tv_sec)*1000000+r.ru_utime.tv_usec+r.ru_stime.tv_usec;
++}
++uint64_t a19_available_memory(void) {
++#ifdef __APPLE__
++    return os_proc_available_memory();
++#else
++    return 0;
++#endif
++}

@@ -1,0 +1,1830 @@
+diff --git a/src/MeloNX/MeloNX/Common/A19Bench.c b/src/MeloNX/MeloNX/Common/A19Bench.c
+index 0fb982b..a7f3a5b 100644
+--- a/src/MeloNX/MeloNX/Common/A19Bench.c
++++ b/src/MeloNX/MeloNX/Common/A19Bench.c
+@@ -76,7 +76,7 @@ uint64_t a19_available_memory(void) {
+ #endif
+ }
+ 
+-// Independent crash-resilient trace. All counters are cumulative except the documented gauges.
++// One native writer, independent of the Swift UI. No logging of game data or paths.
+ #include <stdio.h>
+ #include <pthread.h>
+ #include <unistd.h>
+@@ -86,9 +86,10 @@ uint64_t a19_available_memory(void) {
+ #endif
+ extern int32_t a19_probe_read(int64_t *, int32_t);
+ extern int64_t a19_probe_frequency(void);
++extern int32_t a19_probe_read_trial(int32_t *, int32_t);
+ static pthread_t trace_thread;
+-static int trace_joinable; // start/stop called only from Swift main actor
+-static _Atomic int trace_running, trace_count, trace_error;
++static int trace_joinable; // main actor only
++static _Atomic int trace_running, trace_count, trace_error, trace_phase, trace_exit, trace_thermal;
+ static FILE *trace_file;
+ static uint64_t trace_footprint(void) {
+ #ifdef __APPLE__
+@@ -100,44 +101,60 @@ static uint64_t trace_footprint(void) {
+     return 0;
+ }
+ static int trace_flush(FILE *f) { return fflush(f) == 0 && fsync(fileno(f)) == 0; }
++void a19_trace_mark(int32_t phase, int32_t exit_code) {
++    atomic_store(&trace_exit, exit_code); atomic_store(&trace_phase, phase);
++}
++void a19_trace_thermal(int32_t thermal) { atomic_store(&trace_thermal, thermal); }
+ static void *trace_worker(void *unused) {
+     (void)unused;
++#ifdef __APPLE__
++    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
++#endif
+     FILE *f = trace_file;
+     const double start = ns();
+     double previous = start, previousWrite = 0;
+-    int sequence = 0;
+-    while (atomic_load(&trace_running) && sequence <= 600) {
+-        int64_t values[67];
++    int sequence = 0, lastPhase = -1;
++    while (sequence <= 2400) {
++        int final = !atomic_load(&trace_running);
++        int64_t values[171]; int32_t trial[5] = {-1,-1,-1,-1,-1};
+         double now = ns();
+-        if (a19_probe_read(values, 67) != 67) { atomic_store(&trace_error, 2); break; }
++        if (a19_probe_read(values, 171) != 171) { atomic_store(&trace_error, 2); break; }
++        int trialCount = a19_probe_read_trial(trial, 5);
+         int64_t cpu = a19_cpu_time_us();
+         uint64_t footprint = trace_footprint(), available = a19_available_memory();
+-        fprintf(f, "{\"type\":\"sample\",\"seq\":%d,\"elapsedSeconds\":%.6f,\"intervalSeconds\":%.6f,\"processCPUTimeUs\":%" PRId64 ",\"footprintBytes\":%" PRIu64 ",\"availableProcessBytes\":%" PRIu64 ",\"previousWriteMs\":%.3f,\"counters\":[", sequence, (now-start)/1e9, (now-previous)/1e9, cpu, footprint, available, previousWrite);
+-        for (int i = 0; i < 67; i++) fprintf(f, "%s%" PRId64, i ? "," : "", values[i]);
++        int phase = atomic_load(&trace_phase);
++        fprintf(f, "{\"type\":\"sample\",\"seq\":%d,\"elapsedSeconds\":%.6f,\"intervalSeconds\":%.6f,\"processCPUTimeUs\":%" PRId64 ",\"footprintBytes\":%" PRIu64 ",\"availableProcessBytes\":%" PRIu64 ",\"previousSampleCostMs\":%.3f,\"phase\":%d,\"exitCode\":%d,\"thermalState\":%d,\"trialReadbackCount\":%d,\"trial\":[%d,%d,%d,%d,%d],\"counters\":[", sequence, (now-start)/1e9, (now-previous)/1e9, cpu, footprint, available, previousWrite, phase, atomic_load(&trace_exit), atomic_load(&trace_thermal), trialCount, trial[0],trial[1],trial[2],trial[3],trial[4]);
++        for (int i = 0; i < 171; i++) fprintf(f, "%s%" PRId64, i ? "," : "", values[i]);
+         fputs("]}\n", f);
+-        if (ferror(f) || !trace_flush(f)) { atomic_store(&trace_error, 3); break; }
+-        previousWrite = (ns()-now)/1e6;
+-        previous = now;
++        // Flush each line to the OS; fsync on phase changes, once per second, and final sample.
++        if (ferror(f) || fflush(f) != 0 || ((sequence % 4 == 0 || phase != lastPhase || final) && fsync(fileno(f)) != 0)) { atomic_store(&trace_error, 3); break; }
++        previousWrite = (ns()-now)/1e6; previous = now; lastPhase = phase;
+         atomic_store(&trace_count, ++sequence);
+-        // Poll stop every 100ms; normal sample cadence approximately one second.
+-        for (int i=0; i<10 && atomic_load(&trace_running); i++) {
+-            struct timespec delay = {0, 100000000}; nanosleep(&delay, NULL);
++        if (final || sequence >= 2401) break;
++        // Aim for 250ms start-to-start rather than adding write cost to the period.
++        double deadline = now + 250000000.0;
++        while (atomic_load(&trace_running) && ns() < deadline) {
++            struct timespec delay = {0, 25000000}; nanosleep(&delay, NULL);
+         }
+     }
+-    fclose(f);
+-    atomic_store(&trace_running, 0);
+-    return NULL;
++    int reason = atomic_load(&trace_error) ? 2 : (sequence >= 2401 ? 1 : 0);
++    fprintf(f,"{\"type\":\"footer\",\"reason\":%d,\"samples\":%d,\"phase\":%d,\"exitCode\":%d}\n",reason,sequence,atomic_load(&trace_phase),atomic_load(&trace_exit));
++    if (!trace_flush(f)) atomic_store(&trace_error, 3);
++    fclose(f); atomic_store(&trace_running, 0); return NULL;
+ }
+ void a19_trace_stop(void) {
+     atomic_store(&trace_running, 0);
+     if (trace_joinable) { pthread_join(trace_thread, NULL); trace_joinable = 0; }
+ }
+-int32_t a19_trace_start(const char *path) {
++int32_t a19_trace_start(const char *path, const char *metadata_json) {
+     a19_trace_stop();
+     atomic_store(&trace_count, 0); atomic_store(&trace_error, 0);
++    atomic_store(&trace_phase, 0); atomic_store(&trace_exit, 0);
+     trace_file = fopen(path, "w");
+     if (!trace_file) return 0;
+-    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":2,\"build\":\"A19 Lab 0.6\",\"stopwatchFrequency\":%" PRId64 ",\"counterMode\":\"cumulative except gauges 29-35 and 44-60\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\",\"jit_masked_index_fusions\",\"native_fp16_guest_ops\",\"tile_clear_passes\",\"retained_block_reuses\",\"retained_block_reuse_bytes\",\"qos_set_failures\"]}\n", a19_probe_frequency());
++    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":5,\"build\":\"A19Core Modular 1.2\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\",\"jit_masked_index_fusions\",\"native_fp16_guest_ops\",\"tile_clear_passes\",\"retained_block_reuses\",\"retained_block_reuse_bytes\",\"qos_set_failures\",\"a19_buffer_lookup_hits\",\"a19_buffer_growth_rejected\",\"a19_uniform_reuses\",\"a19_shader_save_requeues\",\"a19_no_spin_renderer_instances\",\"a19_syncpoint_fast_hits\",\"a19_scheduler_rotations\",\"a19_temporary_pool_hits\",\"a19_texture_evictions\",\"a19_isolated_pipeline_calls\",\"a19_thermal_delays\",\"a19_gpfifo_replays\",\"frame_hist_le_4000_us\",\"frame_hist_le_8000_us\",\"frame_hist_le_10000_us\",\"frame_hist_le_12000_us\",\"frame_hist_le_16667_us\",\"frame_hist_le_20000_us\",\"frame_hist_le_25000_us\",\"frame_hist_le_30000_us\",\"frame_hist_le_33334_us\",\"frame_hist_le_40000_us\",\"frame_hist_le_50000_us\",\"frame_hist_le_66667_us\",\"frame_hist_le_83334_us\",\"frame_hist_le_100000_us\",\"frame_hist_le_150000_us\",\"frame_hist_le_200000_us\",\"frame_hist_le_300000_us\",\"frame_hist_le_500000_us\",\"frame_hist_le_1000000_us\",\"frame_hist_le_2000000_us\",\"frame_hist_over_2000000_us\",\"frame_max_us\",\"first_guest_frame_ticks\",\"last_guest_frame_ticks\",\"jit_started\",\"jit_inflight\",\"jit_max_ticks\",\"jit_slow_ge_16ms\",\"jit_last_slow_end_ticks\",\"jit_last_slow_duration_ticks\",\"fence_started\",\"fence_inflight\",\"fence_max_ticks\",\"fence_slow_ge_16ms\",\"fence_last_slow_end_ticks\",\"fence_last_slow_duration_ticks\",\"queue_submit_started\",\"queue_submit_inflight\",\"queue_submit_max_ticks\",\"queue_submit_slow_ge_16ms\",\"queue_submit_last_slow_end_ticks\",\"queue_submit_last_slow_duration_ticks\",\"pipeline_create_started\",\"pipeline_create_inflight\",\"pipeline_create_max_ticks\",\"pipeline_create_slow_ge_16ms\",\"pipeline_create_last_slow_end_ticks\",\"pipeline_create_last_slow_duration_ticks\",\"background_compile_started\",\"background_compile_inflight\",\"background_compile_max_ticks\",\"background_compile_slow_ge_16ms\",\"background_compile_last_slow_end_ticks\",\"background_compile_last_slow_duration_ticks\",\"allocation_started\",\"allocation_inflight\",\"allocation_max_ticks\",\"allocation_slow_ge_16ms\",\"allocation_last_slow_end_ticks\",\"allocation_last_slow_duration_ticks\",\"present_loop_started\",\"present_loop_inflight\",\"present_loop_max_ticks\",\"present_loop_slow_ge_16ms\",\"present_loop_last_slow_end_ticks\",\"present_loop_last_slow_duration_ticks\",\"pipeline_lock_started\",\"pipeline_lock_inflight\",\"pipeline_lock_max_ticks\",\"pipeline_lock_slow_ge_16ms\",\"pipeline_lock_last_slow_end_ticks\",\"pipeline_lock_last_slow_duration_ticks\",\"pipeline_lock_completed\",\"pipeline_lock_ticks\",\"present_loop_completed\",\"present_loop_ticks\",\"pipeline_error_count\",\"background_compile_error_count\",\"log_warning_count\",\"log_error_count\",\"gc_managed_bytes\",\"gc_gen0\",\"gc_gen1\",\"gc_gen2\",\"temporary_pool_retained_bytes\",\"sample_stopwatch_ticks\",\"thermal_state\",\"compile_queue_pending\",\"native_half_supported\",\"first_host_present_ticks\",\"last_pipeline_error_vk_result\",\"no_suitable_memory_type_count\"],\"absoluteIndices\":[29,30,31,32,33,34,35,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,100,101,102,104,105,107,108,110,111,113,114,116,117,119,120,122,123,125,126,128,129,131,132,134,135,137,138,140,141,143,144,146,147,149,150,159,160,161,162,163,164,165,166,167,168,169],\"frameHistogram\":\"disjoint upper bounds in microseconds; last bin overflow\",\"slowThresholdMs\":16,\"sampleTargetMs\":250,\"maxSamples\":2401,\"stopwatchFrequency\":%" PRId64 "}\n", a19_probe_frequency());
++    // Swift JSONEncoder produces a single valid JSON object with escaped strings.
++    fprintf(trace_file, "{\"type\":\"context\",\"data\":%s}\n", metadata_json ? metadata_json : "{}");
+     if (!trace_flush(trace_file)) { fclose(trace_file); return 0; }
+     atomic_store(&trace_running, 1);
+     if (pthread_create(&trace_thread, NULL, trace_worker, NULL) != 0) {
+diff --git a/src/MeloNX/MeloNX/Common/A19Lab.swift b/src/MeloNX/MeloNX/Common/A19Lab.swift
+index 82509da..60cc73b 100644
+--- a/src/MeloNX/MeloNX/Common/A19Lab.swift
++++ b/src/MeloNX/MeloNX/Common/A19Lab.swift
+@@ -6,37 +6,21 @@ import Metal
+ import Darwin
+ 
+ @_silgen_name("a19_probe_enable") private func a19Enable(_ enabled: Int32)
+-@_silgen_name("a19_probe_options") private func a19Options(_ argumentBuffers: Int32, _ commandLimit: Int32, _ shaderWorkers: Int32, _ jitPadCalls: Int32)
+-@_silgen_name("a19_probe_experiments") private func a19Experiments(_ mask: Int32)
++@_silgen_name("a19_probe_apply_trial") private func a19ApplyTrial(_ argumentBuffers: Int32, _ commandLimit: Int32, _ shaderWorkers: Int32, _ jitPadCalls: Int32, _ mask: Int32) -> Int32
++@_silgen_name("a19_probe_read_trial") private func a19ReadTrial(_ output: UnsafeMutablePointer<Int32>, _ count: Int32) -> Int32
++@_silgen_name("a19_trial_thermal") private func a19Thermal(_ state: Int32)
+ @_silgen_name("a19_probe_frequency") private func a19Frequency() -> Int64
+ @_silgen_name("a19_probe_read") private func a19Read(_ output: UnsafeMutablePointer<Int64>, _ count: Int32) -> Int32
+ @_silgen_name("a19_cpu_benchmark") private nonisolated func a19CpuBench(_ output: UnsafeMutablePointer<Double>, _ count: Int32) -> Int32
+-@_silgen_name("a19_cpu_time_us") private func a19CpuTime() -> Int64
+-@_silgen_name("a19_available_memory") private func a19AvailableMemory() -> UInt64
+-@_silgen_name("a19_trace_start") private func a19TraceStart(_ path: UnsafePointer<CChar>) -> Int32
++@_silgen_name("a19_trace_start") private func a19TraceStart(_ path: UnsafePointer<CChar>, _ metadata: UnsafePointer<CChar>) -> Int32
++@_silgen_name("a19_trace_mark") private func a19TraceMark(_ phase: Int32, _ exitCode: Int32)
++@_silgen_name("a19_trace_thermal") private func a19TraceThermal(_ state: Int32)
+ @_silgen_name("a19_trace_stop") private func a19TraceStop()
+ @_silgen_name("a19_trace_count") private func a19TraceCount() -> Int32
+ @_silgen_name("a19_trace_error") private func a19TraceError() -> Int32
+ 
+-private let a19Names: [String] = [
+-    "frames", "frame_interval_us", "frame_le_8_334ms", "frame_8_334_to_16_667ms", "frame_16_667_to_33_334ms", "frame_33_334_to_50ms", "frame_50_to_100ms", "frame_gt_100ms",
+-    "jit_compiles", "jit_compile_ticks", "jit_host_code_bytes", "jit_guest_code_bytes", "jit_shared_copy_bytes", "jit_local_copy_bytes", "jit_local_page_bytes", "jit_pad_calls", "jit_pad_ticks", "jit_local_icache_calls", "jit_local_icache_ticks",
+-    "fence_wait_calls", "fence_wait_ticks", "queue_submit_calls", "queue_submit_ticks", "pipeline_create_calls", "pipeline_create_ticks", "mapped_upload_bytes", "mirror_upload_bytes", "background_compile_jobs", "background_compile_ticks",
+-    "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes",
+-    "mvk_statistics_result", "mvk_spirv_to_msl_count", "mvk_spirv_to_msl_avg_us", "mvk_msl_compile_count", "mvk_msl_compile_avg_us", "mvk_shader_cache_count", "mvk_shader_cache_avg_us", "mvk_pipeline_compile_count", "mvk_pipeline_compile_avg_us", "mvk_retrieve_command_count", "mvk_retrieve_command_avg_us", "mvk_encode_command_count", "mvk_encode_command_avg_us", "mvk_execute_command_count", "mvk_execute_command_avg_us", "mvk_gpu_memory_count", "mvk_gpu_memory_avg_kib_x1000",
+-    "jit_masked_index_fusions", "native_fp16_guest_ops", "tile_clear_passes", "retained_block_reuses", "retained_block_reuse_bytes", "qos_set_failures"
+-]
+-private let a19Gauges = Set(29...35).union(44...60)
++private let a19Names: [String] = ["frames", "frame_interval_us", "frame_le_8_334ms", "frame_8_334_to_16_667ms", "frame_16_667_to_33_334ms", "frame_33_334_to_50ms", "frame_50_to_100ms", "frame_gt_100ms", "jit_compiles", "jit_compile_ticks", "jit_host_code_bytes", "jit_guest_code_bytes", "jit_shared_copy_bytes", "jit_local_copy_bytes", "jit_local_page_bytes", "jit_pad_calls", "jit_pad_ticks", "jit_local_icache_calls", "jit_local_icache_ticks", "fence_wait_calls", "fence_wait_ticks", "queue_submit_calls", "queue_submit_ticks", "pipeline_create_calls", "pipeline_create_ticks", "mapped_upload_bytes", "mirror_upload_bytes", "background_compile_jobs", "background_compile_ticks", "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes", "mvk_statistics_result", "mvk_spirv_to_msl_count", "mvk_spirv_to_msl_avg_us", "mvk_msl_compile_count", "mvk_msl_compile_avg_us", "mvk_shader_cache_count", "mvk_shader_cache_avg_us", "mvk_pipeline_compile_count", "mvk_pipeline_compile_avg_us", "mvk_retrieve_command_count", "mvk_retrieve_command_avg_us", "mvk_encode_command_count", "mvk_encode_command_avg_us", "mvk_execute_command_count", "mvk_execute_command_avg_us", "mvk_gpu_memory_count", "mvk_gpu_memory_avg_kib_x1000", "jit_masked_index_fusions", "native_fp16_guest_ops", "tile_clear_passes", "retained_block_reuses", "retained_block_reuse_bytes", "qos_set_failures", "a19_buffer_lookup_hits", "a19_buffer_growth_rejected", "a19_uniform_reuses", "a19_shader_save_requeues", "a19_no_spin_renderer_instances", "a19_syncpoint_fast_hits", "a19_scheduler_rotations", "a19_temporary_pool_hits", "a19_texture_evictions", "a19_isolated_pipeline_calls", "a19_thermal_delays", "a19_gpfifo_replays", "frame_hist_le_4000_us", "frame_hist_le_8000_us", "frame_hist_le_10000_us", "frame_hist_le_12000_us", "frame_hist_le_16667_us", "frame_hist_le_20000_us", "frame_hist_le_25000_us", "frame_hist_le_30000_us", "frame_hist_le_33334_us", "frame_hist_le_40000_us", "frame_hist_le_50000_us", "frame_hist_le_66667_us", "frame_hist_le_83334_us", "frame_hist_le_100000_us", "frame_hist_le_150000_us", "frame_hist_le_200000_us", "frame_hist_le_300000_us", "frame_hist_le_500000_us", "frame_hist_le_1000000_us", "frame_hist_le_2000000_us", "frame_hist_over_2000000_us", "frame_max_us", "first_guest_frame_ticks", "last_guest_frame_ticks", "jit_started", "jit_inflight", "jit_max_ticks", "jit_slow_ge_16ms", "jit_last_slow_end_ticks", "jit_last_slow_duration_ticks", "fence_started", "fence_inflight", "fence_max_ticks", "fence_slow_ge_16ms", "fence_last_slow_end_ticks", "fence_last_slow_duration_ticks", "queue_submit_started", "queue_submit_inflight", "queue_submit_max_ticks", "queue_submit_slow_ge_16ms", "queue_submit_last_slow_end_ticks", "queue_submit_last_slow_duration_ticks", "pipeline_create_started", "pipeline_create_inflight", "pipeline_create_max_ticks", "pipeline_create_slow_ge_16ms", "pipeline_create_last_slow_end_ticks", "pipeline_create_last_slow_duration_ticks", "background_compile_started", "background_compile_inflight", "background_compile_max_ticks", "background_compile_slow_ge_16ms", "background_compile_last_slow_end_ticks", "background_compile_last_slow_duration_ticks", "allocation_started", "allocation_inflight", "allocation_max_ticks", "allocation_slow_ge_16ms", "allocation_last_slow_end_ticks", "allocation_last_slow_duration_ticks", "present_loop_started", "present_loop_inflight", "present_loop_max_ticks", "present_loop_slow_ge_16ms", "present_loop_last_slow_end_ticks", "present_loop_last_slow_duration_ticks", "pipeline_lock_started", "pipeline_lock_inflight", "pipeline_lock_max_ticks", "pipeline_lock_slow_ge_16ms", "pipeline_lock_last_slow_end_ticks", "pipeline_lock_last_slow_duration_ticks", "pipeline_lock_completed", "pipeline_lock_ticks", "present_loop_completed", "present_loop_ticks", "pipeline_error_count", "background_compile_error_count", "log_warning_count", "log_error_count", "gc_managed_bytes", "gc_gen0", "gc_gen1", "gc_gen2", "temporary_pool_retained_bytes", "sample_stopwatch_ticks", "thermal_state", "compile_queue_pending", "native_half_supported", "first_host_present_ticks", "last_pipeline_error_vk_result", "no_suitable_memory_type_count"]
+ 
+-private struct A19Sample: Codable {
+-    let elapsedSeconds: Double
+-    let intervalSeconds: Double
+-    let thermalState: Int
+-    let footprintBytes: UInt64?
+-    let availableProcessBytes: UInt64
+-    let processCPUTimeDeltaUs: Int64?
+-    let counters: [String: Int64]
+-}
+ private struct A19Report: Codable {
+     let schemaVersion: Int
+     let build: String
+@@ -49,7 +33,6 @@ private struct A19Report: Codable {
+     let stopwatchFrequency: Int64
+     let benchmarkHardware: [String: String]
+     let benchmarks: [String: Double]
+-    let samples: [A19Sample]
+     let note: String
+     let benchmarkNotes: [String: String]
+ }
+@@ -107,9 +90,35 @@ private nonisolated enum A19Hardware {
+     }
+ }
+ 
++// This snapshot is separate from the editable UI and the running engine.
++private struct A19LabSelection: Codable, Equatable {
++    var argumentBuffers = 0
++    var commandLimit = 0
++    var shaderWorkers = 0
++    var jitPadCalls = 0
++    var experimentMask = 0
++    static let reference = A19LabSelection()
++    var valid: Bool {
++        [0, 1, 2].contains(argumentBuffers) && [0, 32, 64, 128].contains(commandLimit) &&
++        [0, 1, 2].contains(shaderWorkers) && [0, 4, 8, 16].contains(jitPadCalls) &&
++        (0...131071).contains(experimentMask)
++    }
++    var values: [Int32] {
++        [argumentBuffers, commandLimit, shaderWorkers, jitPadCalls, experimentMask].map { Int32($0) }
++    }
++    var report: [String: Int] {
++        ["argumentBuffers": argumentBuffers, "commandLimit": commandLimit,
++         "shaderWorkers": shaderWorkers, "jitPadCalls": jitPadCalls, "experimentMask": experimentMask]
++    }
++    var enabledCount: Int {
++        experimentMask.nonzeroBitCount + [argumentBuffers, commandLimit, shaderWorkers, jitPadCalls].filter { $0 != 0 }.count
++    }
++}
++
+ @MainActor final class A19Lab: ObservableObject {
+     static let shared = A19Lab()
+     @Published private(set) var running = false
++    @Published var automaticTrace = true { didSet { UserDefaults.standard.set(automaticTrace, forKey: "A19Core.autoTrace") } }
+     @Published private(set) var benchmarking = false
+     @Published private(set) var sampleCount = 0
+     @Published private(set) var reportURL: URL?
+@@ -124,11 +133,80 @@ private nonisolated enum A19Hardware {
+     @Published var tileClear = false
+     @Published var reuseBlocks = false
+     @Published var workerQoS = false
++    @Published var bufferLookup = false
++    @Published var mappedGrowth = false
++    @Published var uniformReuse = false
++    @Published var shaderSaveQueue = false
++    @Published var idleWait = false
++    @Published var fenceFast = false
++    @Published var schedulerAlloc = false
++    @Published var poolBudget = false
++    @Published var textureBudget = false
++    @Published var isolatedPipelines = false
++    @Published var thermalCompile = false
++    @Published var commandReuse = false
++    @Published private(set) var gameActive = false
++    @Published private(set) var applyStatus = "Referencia: todas las opciones desactivadas."
++    @Published private var savedSelection = A19LabSelection.reference
++    @Published private var activeSelection: A19LabSelection?
++    var hasPendingChanges: Bool { selection != savedSelection }
++    var activeSummary: String? {
++        activeSelection.map { "Configuración recibida por el núcleo: \($0.enabledCount) opciones; máscara \($0.experimentMask)." }
++    }
++    private var thermalTask: Task<Void, Never>?
+     private var experimentMask: Int {
+-        (compactJIT ? 1 : 0) | (nativeFP16 ? 2 : 0) | (tileClear ? 4 : 0) | (reuseBlocks ? 8 : 0) | (workerQoS ? 16 : 0)
++        var mask = 0
++        if compactJIT { mask |= 1 }
++        if nativeFP16 { mask |= 2 }
++        if tileClear { mask |= 4 }
++        if reuseBlocks { mask |= 8 }
++        if workerQoS { mask |= 16 }
++        if bufferLookup { mask |= 32 }
++        if mappedGrowth { mask |= 64 }
++        if uniformReuse { mask |= 128 }
++        if shaderSaveQueue { mask |= 256 }
++        if idleWait { mask |= 512 }
++        if fenceFast { mask |= 1024 }
++        if schedulerAlloc { mask |= 2048 }
++        if poolBudget { mask |= 4096 }
++        if textureBudget { mask |= 8192 }
++        if isolatedPipelines { mask |= 16384 }
++        if thermalCompile { mask |= 32768 }
++        if commandReuse { mask |= 65536 }
++        return mask
++    }
++    private var selection: A19LabSelection {
++        A19LabSelection(argumentBuffers: argumentBuffers, commandLimit: commandLimit,
++                        shaderWorkers: shaderWorkers, jitPadCalls: jitPadCalls, experimentMask: experimentMask)
++    }
++    private func restoreSelection(_ value: A19LabSelection) {
++        argumentBuffers = value.argumentBuffers
++        commandLimit = value.commandLimit
++        shaderWorkers = value.shaderWorkers
++        jitPadCalls = value.jitPadCalls
++        compactJIT = (value.experimentMask & 1) != 0
++        nativeFP16 = (value.experimentMask & 2) != 0
++        tileClear = (value.experimentMask & 4) != 0
++        reuseBlocks = (value.experimentMask & 8) != 0
++        workerQoS = (value.experimentMask & 16) != 0
++        bufferLookup = (value.experimentMask & 32) != 0
++        mappedGrowth = (value.experimentMask & 64) != 0
++        uniformReuse = (value.experimentMask & 128) != 0
++        shaderSaveQueue = (value.experimentMask & 256) != 0
++        idleWait = (value.experimentMask & 512) != 0
++        fenceFast = (value.experimentMask & 1024) != 0
++        schedulerAlloc = (value.experimentMask & 2048) != 0
++        poolBudget = (value.experimentMask & 4096) != 0
++        textureBudget = (value.experimentMask & 8192) != 0
++        isolatedPipelines = (value.experimentMask & 16384) != 0
++        thermalCompile = (value.experimentMask & 32768) != 0
++        commandReuse = (value.experimentMask & 65536) != 0
++    }
++    func resetOptions() {
++        restoreSelection(.reference)
++        apply()
+     }
+     private var task: Task<Void, Never>?
+-    private var samples: [A19Sample] = []
+     private var benchmarks: [String: Double] = [:]
+     private var benchmarkHardware: [String: String] = [:]
+     private var hardware: [String: String] = [:]
+@@ -137,26 +215,57 @@ private nonisolated enum A19Hardware {
+     private var gameStartSeconds: Double?
+     private var gameEndSeconds: Double?
+     private var gameExitCode: Int?
+-    private var previous = [Int64](repeating: 0, count: 67)
+     private var started = 0.0
+-    private var lastTime = 0.0
+-    private var lastCpu: Int64 = -1
+     private let reportName = "MeloNX-A19-research.json"
+-    private var destination: URL {
+-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(reportName)
+-    }
+-    private var traceDestination: URL {
+-        destination.deletingLastPathComponent().appendingPathComponent("MeloNX-A19-trace.jsonl")
+-    }
++    private var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
++    private var logDirectory: URL { documents.appendingPathComponent("A19Core-Diagnostics", isDirectory: true) }
++    private var sessionTrace: URL?
++    private var destination: URL { sessionTrace?.deletingPathExtension().appendingPathExtension("json") ?? documents.appendingPathComponent(reportName) }
++    private var selectionURL: URL { documents.appendingPathComponent("A19Core-options.json") }
+     init() {
+-        if FileManager.default.fileExists(atPath: destination.path) { reportURL = destination }
+-        if FileManager.default.fileExists(atPath: traceDestination.path) { traceURL = traceDestination }
++        automaticTrace = UserDefaults.standard.object(forKey: "A19Core.autoTrace") as? Bool ?? true
++        if let latest = try? FileManager.default.contentsOfDirectory(at: logDirectory, includingPropertiesForKeys: nil).filter({ $0.pathExtension == "jsonl" }).sorted(by: { $0.lastPathComponent > $1.lastPathComponent }).first {
++            traceURL = latest
++            let report = latest.deletingPathExtension().appendingPathExtension("json")
++            if FileManager.default.fileExists(atPath: report.path) { reportURL = report }
++        }
++        if FileManager.default.fileExists(atPath: selectionURL.path) {
++            do {
++                let value = try JSONDecoder().decode(A19LabSelection.self, from: Data(contentsOf: selectionURL))
++                if value.valid {
++                    savedSelection = value
++                    restoreSelection(value)
++                    applyStatus = "Configuración recuperada: \(value.enabledCount) opciones."
++                } else {
++                    applyStatus = "Configuración inválida. Se usará la referencia hasta guardar otra selección."
++                }
++            } catch {
++                applyStatus = "No se pudo leer la configuración. Se usará la referencia."
++            }
++        }
+     }
+-    func apply() {
+-        guard !running && !benchmarking && !RyujinxController.shared.isEngineActive && !RyujinxController.shared.isRunning.isRunning() else { return }
+-        a19Options(Int32(argumentBuffers), Int32(commandLimit), Int32(shaderWorkers), Int32(jitPadCalls))
+-        a19Experiments(Int32(experimentMask))
+-        status = "Options applied for next game."
++    // The button stages a durable selection, not a live engine mutation.
++    @discardableResult func apply() -> Bool {
++        let value = selection
++        guard value.valid else { applyStatus = "Selección inválida; no se guardó."; return false }
++        do {
++            try JSONEncoder().encode(value).write(to: selectionURL, options: .atomic)
++            let verified = try JSONDecoder().decode(A19LabSelection.self, from: Data(contentsOf: selectionURL))
++            guard verified == value else { applyStatus = "La lectura de la configuración no coincide."; return false }
++            savedSelection = verified
++            applyStatus = "Guardadas \(verified.enabledCount) opciones (máscara \(verified.experimentMask)). Se aplicarán al próximo juego."
++            return true
++        } catch {
++            applyStatus = "No se pudo guardar: \(error.localizedDescription)"
++            return false
++        }
++    }
++    private func installForLaunch(_ value: A19LabSelection) -> Bool {
++        let v = value.values
++        guard a19ApplyTrial(v[0], v[1], v[2], v[3], v[4]) == 1 else { return false }
++        var actual = [Int32](repeating: -1, count: 5)
++        let count = actual.withUnsafeMutableBufferPointer { a19ReadTrial($0.baseAddress!, Int32($0.count)) }
++        return count == 5 && actual == v
+     }
+     private func metadata() -> [String: String] {
+         let info = ProcessInfo.processInfo
+@@ -190,66 +299,98 @@ private nonisolated enum A19Hardware {
+             hardware["thermalAfterBenchmark"] = String(ProcessInfo.processInfo.thermalState.rawValue)
+             benchmarkHardware = hardware
+             benchmarking = false; status = "Benchmark finished: \(values.count) measurements."
++            sessionTrace = nil
+             selected = ["argumentBuffers":argumentBuffers,"commandLimit":commandLimit,"shaderWorkers":shaderWorkers,"jitPadCalls":jitPadCalls,"experimentMask":experimentMask]
+-            samples = []; sampleCount = 0; gameSettings = [:]; gameStartSeconds = nil; gameEndSeconds = nil; gameExitCode = nil; writeReport()
++            sampleCount = 0; gameSettings = [:]; gameStartSeconds = nil; gameEndSeconds = nil; gameExitCode = nil; writeReport()
+         }
+     }
+     private func read() -> [Int64]? {
+-        var result = [Int64](repeating: 0, count: 67)
++        var result = [Int64](repeating: 0, count: a19Names.count)
+         let count = result.withUnsafeMutableBufferPointer { a19Read($0.baseAddress!, Int32($0.count)) }
+         return count == Int32(result.count) ? result : nil
+     }
+-    private func footprint() -> UInt64? {
+-        var value = task_vm_info_data_t()
+-        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.stride)/4
+-        let code = withUnsafeMutablePointer(to: &value) { p in
+-            p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
++    func gameWillStart(_ settings: Options, game: GameInfo) -> Bool {
++        guard !gameActive && !benchmarking else {
++            applyStatus = "Terminá la partida o el benchmark antes de iniciar otro juego."
++            return false
+         }
+-        return code == KERN_SUCCESS ? value.phys_footprint : nil
+-    }
+-    func gameWillStart(_ settings: Options) {
+-        guard running else { return }
+-        gameStartSeconds = ProcessInfo.processInfo.systemUptime-started
+-        gameSettings = ["resolutionScale": String(settings.resScale), "docked": String(!settings.disableDockedMode), "vsyncDisabled": String(settings.disableVSync), "shaderCacheDisabled": String(settings.disableShaderCache), "asyncShaders": String(settings.enableAsyncShaderCompilation), "memoryManager": String(settings.memoryManagerMode.rawValue), "textureRecompression": String(settings.enableTextureRecompression), "expandRAM": String(settings.expandRAM)]
+-        writeReport()
++        // Apply only the committed selection. Unsaved edits are intentionally ignored.
++        var value = savedSelection
++        let requested = value.report
++        var readback = "verified"
++        if !installForLaunch(value) {
++            value = .reference
++            readback = "fallback_reference"
++            guard installForLaunch(value) else {
++                applyStatus = "El núcleo rechazó incluso la configuración de referencia. Reiniciá la app."
++                return false
++            }
++        }
++        activeSelection = value; selected = value.report
++        applyStatus = readback == "verified" ? "Configuración recibida: máscara \(value.experimentMask)." : "Configuración rechazada; se usará la referencia."
++        gameActive = true
++        gameSettings = ["titleId": game.titleId, "version": game.version, "resolutionScale": String(settings.resScale), "docked": String(!settings.disableDockedMode), "vsyncDisabled": String(settings.disableVSync), "shaderCacheDisabled": String(settings.disableShaderCache), "asyncShaders": String(settings.enableAsyncShaderCompilation), "memoryManager": String(settings.memoryManagerMode.rawValue), "textureRecompression": String(settings.enableTextureRecompression), "expandRAM": String(settings.expandRAM), "trialConfigReadback": readback]
++        thermalTask?.cancel()
++        let thermal = Int32(ProcessInfo.processInfo.thermalState.rawValue)
++        a19Thermal(thermal); a19TraceThermal(thermal)
++        if automaticTrace { beginTrace(requested: requested) }
++        if running { a19TraceMark(1, 0); gameStartSeconds = ProcessInfo.processInfo.systemUptime-started }
++        thermalTask = Task { [weak self] in
++            while !Task.isCancelled {
++                try? await Task.sleep(nanoseconds: 1_000_000_000)
++                guard !Task.isCancelled, let self, self.gameActive else { break }
++                let state = Int32(ProcessInfo.processInfo.thermalState.rawValue)
++                a19Thermal(state); a19TraceThermal(state)
++            }
++        }
++        if running { writeReport() }
++        return true
+     }
+     func gameDidEnd(_ exitCode: Int) {
++        gameActive = false
++        activeSelection = nil
++        thermalTask?.cancel(); thermalTask = nil
+         guard running else { return }
+         gameEndSeconds = ProcessInfo.processInfo.systemUptime-started
+         gameExitCode = exitCode
++        a19TraceMark(2, Int32(clamping: exitCode))
+         stop()
+     }
+-    func start() {
+-        guard !running && !benchmarking && !RyujinxController.shared.isEngineActive && !RyujinxController.shared.isRunning.isRunning() else { return }
+-        guard let initial = read() else { status = "Core telemetry ABI unavailable."; return }
+-        apply(); previous = initial; hardware = metadata(); samples = []; sampleCount = 0
+-        gameSettings = [:]; gameStartSeconds = nil; gameEndSeconds = nil; gameExitCode = nil
+-        selected = ["argumentBuffers":argumentBuffers,"commandLimit":commandLimit,"shaderWorkers":shaderWorkers,"jitPadCalls":jitPadCalls,"experimentMask":experimentMask]
+-        started = ProcessInfo.processInfo.systemUptime; lastTime = started; lastCpu = a19CpuTime()
+-        a19Enable(1)
+-        guard traceDestination.path.withCString({ a19TraceStart($0) }) == 1 else {
+-            a19Enable(0); status = "Native trace could not start."; return
+-        }
+-        traceURL = traceDestination
+-        running = true; status = "Native capture active. Start a controlled test."
+-        writeReport()
+-        task = Task { [weak self] in
+-            while !Task.isCancelled {
+-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+-                guard !Task.isCancelled, let self, self.running else { break }
+-                self.sampleCount = Int(a19TraceCount())
+-                if a19TraceError() != 0 || self.sampleCount >= 601 { self.stop(); break }
++    private func beginTrace(requested: [String: Int]) {
++        guard !running else { return }
++        guard read() != nil else { status = "ABI de diagnóstico no disponible; el juego continuará."; return }
++        let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
++        let session = formatter.string(from: Date()).replacingOccurrences(of: ":", with: "-") + "-" + UUID().uuidString
++        let url = logDirectory.appendingPathComponent(session + ".jsonl")
++        do {
++            try FileManager.default.createDirectory(at: logDirectory, withIntermediateDirectories: true)
++            let old = try FileManager.default.contentsOfDirectory(at: logDirectory, includingPropertiesForKeys: nil).filter { $0.pathExtension == "jsonl" }.sorted { $0.lastPathComponent > $1.lastPathComponent }
++            // Keep the nine newest prior sessions. Never delete unrelated files or the active trace.
++            for item in old.dropFirst(9) {
++                try? FileManager.default.removeItem(at: item)
++                try? FileManager.default.removeItem(at: item.deletingPathExtension().appendingPathExtension("json"))
+             }
+-        }
+-    }
+-    private func sample() {
+-        guard let current = read() else { return }
+-        let now = ProcessInfo.processInfo.systemUptime; let cpu = a19CpuTime()
+-        var counters: [String: Int64] = [:]
+-        for i in current.indices { counters[a19Names[i]] = a19Gauges.contains(i) ? current[i] : max(0,current[i]-previous[i]) }
+-        samples.append(A19Sample(elapsedSeconds: now-started, intervalSeconds: now-lastTime, thermalState: ProcessInfo.processInfo.thermalState.rawValue, footprintBytes: footprint(), availableProcessBytes: a19AvailableMemory(), processCPUTimeDeltaUs: cpu >= lastCpu && lastCpu >= 0 ? cpu-lastCpu : nil, counters: counters))
+-        previous = current; lastTime = now; lastCpu = cpu; sampleCount = samples.count
+-        if sampleCount % 10 == 0 { writeReport() }
++            hardware = metadata()
++            let context: [String: Any] = ["session": session, "hardware": hardware, "requested": requested, "accepted": selected, "gameSettings": gameSettings, "startedUTC": formatter.string(from: Date())]
++            let data = try JSONSerialization.data(withJSONObject: context, options: [.sortedKeys])
++            guard let json = String(data: data, encoding: .utf8) else { return }
++            sampleCount = 0
++            gameStartSeconds = nil; gameEndSeconds = nil; gameExitCode = nil
++            started = ProcessInfo.processInfo.systemUptime
++            a19Enable(1)
++            let ok = url.path.withCString { path in json.withCString { a19TraceStart(path, $0) } }
++            guard ok == 1 else { a19Enable(0); status = "No se pudo abrir el diagnóstico; el juego continuará."; return }
++            sessionTrace = url; traceURL = url; reportURL = nil
++            running = true; status = "Diagnóstico automático activo."
++            task = Task { [weak self] in
++                while !Task.isCancelled {
++                    try? await Task.sleep(nanoseconds: 1_000_000_000)
++                    guard !Task.isCancelled, let self, self.running else { break }
++                    self.sampleCount = Int(a19TraceCount())
++                    if a19TraceError() != 0 || self.sampleCount >= 2401 { self.stop(); break }
++                }
++            }
++        } catch { status = "No se pudo preparar el diagnóstico; el juego continuará." }
+     }
+     func stop() {
+         guard running else { return }
+@@ -259,7 +400,7 @@ private nonisolated enum A19Hardware {
+         writeReport()
+     }
+     private func writeReport() {
+-        let report = A19Report(schemaVersion: 2, build: "A19 Lab 0.6", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Native JSONL counters are cumulative except gauges at indices 29–35 and 44–60; export both files. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
++        let report = A19Report(schemaVersion: 5, build: "A19Core Modular 1.2", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, note: "Schema 5: use absoluteIndices in native JSONL header. JSONL is self-contained; this summary is optional. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes negative or zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, game content, pairing or file paths included. Game title ID and version are included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
+         do { let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]; try encoder.encode(report).write(to: destination, options: .atomic); reportURL = destination }
+         catch { status = "Report could not be saved." }
+     }
+@@ -283,20 +424,43 @@ struct A19LabView: View {
+                 Toggle("TBDR full color clear", isOn: $lab.tileClear)
+                 Toggle("Bounded Vulkan block reuse", isOn: $lab.reuseBlocks)
+                 Toggle("Shader worker QoS", isOn: $lab.workerQoS)
+-                Button("Apply for next game") { lab.apply() }
+-            }.disabled(lab.running || lab.benchmarking)
++            }.disabled(lab.benchmarking)
++            Section("A19Core — mejoras independientes") {
++                Toggle("Búsqueda rápida de buffers", isOn: $lab.bufferLookup)
++                Toggle("Crecimiento de buffers seguro", isOn: $lab.mappedGrowth)
++                Toggle("Bindings uniformes sin cambios", isOn: $lab.uniformReuse)
++                Toggle("Cola de guardado de shaders", isOn: $lab.shaderSaveQueue)
++                Toggle("Render: espera sin giro activo", isOn: $lab.idleWait)
++                Toggle("Syncpoints ya alcanzados", isOn: $lab.fenceFast)
++                Toggle("Scheduler sin cierres temporales", isOn: $lab.schedulerAlloc)
++                Toggle("Límite de buffers temporales", isOn: $lab.poolBudget)
++                Toggle("Caché de texturas adaptativa", isOn: $lab.textureBudget)
++                Toggle("Pipelines independientes (experimental)", isOn: $lab.isolatedPipelines)
++                Toggle("Compilación sensible a temperatura", isOn: $lab.thermalCompile)
++                Toggle("Reutilización GPFIFO adaptativa", isOn: $lab.commandReuse)
++                Button("Aplicar al próximo juego") { lab.apply() }
++                    .buttonStyle(.borderless)
++                Button("Restablecer referencia") { lab.resetOptions() }
++                    .buttonStyle(.borderless)
++                if lab.hasPendingChanges {
++                    Text("Cambios sin guardar. Se ignorarán hasta pulsar Aplicar.").font(.caption).foregroundStyle(.secondary)
++                }
++                Text(lab.applyStatus).font(.caption)
++                if let active = lab.activeSummary { Text(active).font(.caption) }
++                Text("Todas desactivadas = referencia v0.6. Cambiá una sola opción por prueba. Podés guardar durante una captura: nunca se modifica la partida en ejecución.").font(.caption)
++            }.disabled(lab.benchmarking)
+             Section("Core trace") {
+-                if lab.running { Button("Stop and save trace") { lab.stop() } }
+-                else { Button("Start trace") { lab.start() }.disabled(lab.benchmarking) }
+-                Text("Samples: \(lab.sampleCount) / 601. Native JSONL saved from the first sample, even if the interface stalls.").font(.caption)
++                Toggle("Diagnóstico automático al iniciar juego", isOn: $lab.automaticTrace)
++                if lab.running { Button("Detener y guardar diagnóstico") { lab.stop() } }
++                Text("Muestras: \(lab.sampleCount) / 2401. Un JSONL por partida, hasta 10 minutos aproximadamente; conserva las 10 sesiones más recientes.").font(.caption)
+             }
+             Section("Export") {
+-                if let url = lab.reportURL {
++                if let url = lab.reportURL, !lab.running {
+                     if #available(iOS 16.0, *) { ShareLink(item: url) { Label("Share research JSON", systemImage: "square.and.arrow.up") } }
+                     else { Text("Report saved in Files: \(url.lastPathComponent)") }
+                 }
+-                if let trace = lab.traceURL {
+-                    if #available(iOS 16.0, *) { ShareLink(item: trace) { Label("Share native trace JSONL", systemImage: "square.and.arrow.up") } }
++                if let trace = lab.traceURL, !lab.running {
++                    if #available(iOS 16.0, *) { ShareLink(item: trace) { Label("Compartir diagnóstico JSONL", systemImage: "square.and.arrow.up") } }
+                 }
+                 Text(lab.status).font(.caption)
+             }
+diff --git a/src/MeloNX/MeloNX/Core/RyujinxController.swift b/src/MeloNX/MeloNX/Core/RyujinxController.swift
+index 69a6187..9b19c0f 100644
+--- a/src/MeloNX/MeloNX/Core/RyujinxController.swift
++++ b/src/MeloNX/MeloNX/Core/RyujinxController.swift
+@@ -234,7 +234,10 @@ class RyujinxController: ObservableObject {
+         
+         settings.inputPath = game.fileURL.path
+         settings.backendThreading = .on
+-        A19Lab.shared.gameWillStart(settings)
++        guard A19Lab.shared.gameWillStart(settings, game: game) else {
++            isRunning = .crashed(result: A19Lab.shared.applyStatus)
++            return
++        }
+         
+         isRunning = .started(game: game)
+         _isPaused = false
+diff --git a/src/Ryujinx.Common/A19Probe.cs b/src/Ryujinx.Common/A19Probe.cs
+index 88c4f23..cc78ef9 100644
+--- a/src/Ryujinx.Common/A19Probe.cs
++++ b/src/Ryujinx.Common/A19Probe.cs
+@@ -7,22 +7,46 @@ namespace Ryujinx.Common
+     // Cumulative counters; snapshots are deliberately non-blocking and approximate across threads.
+     public static class A19Probe
+     {
+-        public const int Count = 67;
++        public const int Count = 171;
+         // A19 reports 128-byte cache lines. 256-byte stride also prevents adjacent counters sharing a line.
+         private const int Stride = 32;
+         private static readonly long[] Values = new long[Count * Stride];
+         private static int _enabled, _argumentBuffers, _commandLimit, _shaderWorkers, _jitPadCalls;
+-        private static int _experiments, _nativeHalfSupported;
++        private static int _experiments, _nativeHalfSupported = -1;
+         public static bool Experiment(int mask) => OperatingSystem.IsIOS() && (Volatile.Read(ref _experiments) & mask) != 0;
+-        public static bool NativeHalf => Experiment(2) && Volatile.Read(ref _nativeHalfSupported) != 0;
+-        public static void SetExperiments(int mask) => Volatile.Write(ref _experiments, mask & 31);
++        public static int ExperimentMask => Volatile.Read(ref _experiments);
++        // Only called before game construction, never for a live engine.
++        public static bool ApplyTrial(int arg, int limit, int workers, int padCalls, int mask)
++        {
++            if (!OperatingSystem.IsIOS() || arg is not (0 or 1 or 2) ||
++                limit is not (0 or 32 or 64 or 128) || workers is not (0 or 1 or 2) ||
++                padCalls is not (0 or 4 or 8 or 16) || mask < 0 || mask > 131071)
++                return false;
++            Options(arg, limit, workers, padCalls);
++            SetExperiments(mask);
++            return ArgumentBuffers == arg && CommandLimit == limit && ShaderWorkers == workers &&
++                JitPadCalls == padCalls && ExperimentMask == mask;
++        }
++        public static bool NativeHalf => Experiment(2) && Volatile.Read(ref _nativeHalfSupported) == 1;
++        public static void SetExperiments(int mask) => Volatile.Write(ref _experiments, mask & 131071);
+         public static void SetNativeHalfSupported(bool supported) => Volatile.Write(ref _nativeHalfSupported, supported ? 1 : 0);
+         public static bool Enabled => Volatile.Read(ref _enabled) != 0;
+         public static int ArgumentBuffers => Volatile.Read(ref _argumentBuffers);
+         public static int CommandLimit => Volatile.Read(ref _commandLimit);
+         public static int ShaderWorkers => Volatile.Read(ref _shaderWorkers);
+         public static int JitPadCalls => Volatile.Read(ref _jitPadCalls);
+-        public static void Enable(int enabled) => Volatile.Write(ref _enabled, enabled);
++        public static void Enable(int enabled)
++        {
++            // Capture starts only before game construction, after the previous engine exited.
++            if (enabled != 0 && !Enabled)
++            {
++                Array.Clear(Values);
++                for (int i = 29; i <= 35; i++) Set(i, -1);
++                Set(44, -104);
++                Volatile.Write(ref _nativeHalfSupported, -1);
++            }
++            Volatile.Write(ref _enabled, enabled);
++        }
+         public static void Options(int arg, int limit, int workers, int padCalls)
+         {
+             Volatile.Write(ref _argumentBuffers, arg is 1 or 2 ? arg : 0);
+@@ -50,6 +74,64 @@ namespace Ryujinx.Common
+             Interlocked.Add(ref Values[1 * Stride], us);
+             int bucket = us <= 8334 ? 2 : us <= 16667 ? 3 : us <= 33334 ? 4 : us <= 50000 ? 5 : us <= 100000 ? 6 : 7;
+             Interlocked.Increment(ref Values[bucket * Stride]);
++            int fine = 0;
++            while (fine < FrameBoundsUs.Length && us > FrameBoundsUs[fine]) fine++;
++            Add(79 + fine); Max(100, us);
++        }
++        private static readonly int[] FrameBoundsUs = [4000, 8000, 10000, 12000, 16667, 20000, 25000, 30000, 33334, 40000, 50000, 66667, 83334, 100000, 150000, 200000, 300000, 500000, 1000000, 2000000];
++        private static int Stage(int count) => count switch
++        {
++            8 => 103, 19 => 109, 21 => 115, 23 => 121, 27 => 127,
++            40 => 133, 153 => 139, 151 => 145, _ => -1,
++        };
++        public static long Begin(int count)
++        {
++            long start = Start();
++            if (start == 0) return 0;
++            int stage = Stage(count);
++            if (stage >= 0) { Add(stage); Add(stage + 1); }
++            return start;
++        }
++        public static void Finish(long start, int count, int ticks)
++        {
++            if (start == 0 || !Enabled) return;
++            long end = Stopwatch.GetTimestamp(), duration = end - start;
++            Add(count); Add(ticks, duration);
++            int stage = Stage(count);
++            if (stage < 0) return;
++            Add(stage + 1, -1);
++            Max(stage + 2, duration);
++            if (duration >= Stopwatch.Frequency * 16 / 1000)
++            {
++                Add(stage + 3);
++                // Approximate pair under concurrent writers; not an ordered event stream.
++                Set(stage + 5, duration); Set(stage + 4, end);
++            }
++        }
++        private static void Max(int index, long value)
++        {
++            ref long target = ref Values[index * Stride];
++            long prev;
++            while (value > (prev = Interlocked.Read(ref target)) &&
++                Interlocked.CompareExchange(ref target, value, prev) != prev) { }
++        }
++        public static void GuestPresented()
++        {
++            if (!Enabled) return;
++            long now = Stopwatch.GetTimestamp();
++            Interlocked.CompareExchange(ref Values[101 * Stride], now, 0);
++            Set(102, now);
++        }
++        public static void HostPresented()
++        {
++            if (Enabled) Interlocked.CompareExchange(ref Values[168 * Stride], Stopwatch.GetTimestamp(), 0);
++        }
++        public static void SnapshotRuntime()
++        {
++            Set(159, GC.GetTotalMemory(false));
++            Set(160, GC.CollectionCount(0)); Set(161, GC.CollectionCount(1)); Set(162, GC.CollectionCount(2));
++            Set(163, A19Trial.PooledBytes); Set(164, Stopwatch.GetTimestamp());
++            Set(165, A19Trial.Thermal); Set(167, Volatile.Read(ref _nativeHalfSupported));
+         }
+         public static long Read(int index) => Interlocked.Read(ref Values[index * Stride]);
+     }
+diff --git a/src/Ryujinx.Common/A19Trial.cs b/src/Ryujinx.Common/A19Trial.cs
+new file mode 100644
+index 0000000..20979ac
+--- /dev/null
++++ b/src/Ryujinx.Common/A19Trial.cs
+@@ -0,0 +1,65 @@
++using System;
++using System.Diagnostics;
++using System.Runtime.InteropServices;
++using System.Threading;
++
++namespace Ryujinx.Common
++{
++    // Settings are applied once before a game creates its engine. No hot changes.
++    public static class A19Trial
++    {
++        public const int BufferLookup = 32;
++        public const int MappedGrowth = 64;
++        public const int UniformReuse = 128;
++        public const int ShaderSaveQueue = 256;
++        public const int IdleWait = 512;
++        public const int FenceFast = 1024;
++        public const int SchedulerAlloc = 2048;
++        public const int PoolBudget = 4096;
++        public const int TextureBudget = 8192;
++        public const int IsolatedPipelines = 16384;
++        public const int ThermalCompile = 32768;
++        public const int CommandReuse = 65536;
++        private static int _thermal;
++        private static long _available = -1, _sampleTime;
++        private static long _pooledBytes;
++        public static long PooledBytes => Interlocked.Read(ref _pooledBytes);
++        private const long PoolLimit = 32L * 1024 * 1024;
++        public static void SetThermal(int state) => Volatile.Write(ref _thermal, Math.Clamp(state, 0, 3));
++        public static int Thermal => Volatile.Read(ref _thermal);
++        [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "os_proc_available_memory")]
++        private static extern nuint AvailableNative();
++        public static long AvailableBytes
++        {
++            get
++            {
++                if (!OperatingSystem.IsIOS()) return -1;
++                long now = Stopwatch.GetTimestamp();
++                long prev = Volatile.Read(ref _sampleTime);
++                if (prev == 0 || now - prev >= Stopwatch.Frequency)
++                {
++                    if (Interlocked.CompareExchange(ref _sampleTime, now, prev) == prev)
++                    {
++                        long available = -1;
++                        try { available = checked((long)AvailableNative()); }
++                        catch (EntryPointNotFoundException) { }
++                        catch (DllNotFoundException) { }
++                        Volatile.Write(ref _available, available);
++                    }
++                }
++                return Volatile.Read(ref _available);
++            }
++        }
++        public static bool TryReservePool(long bytes)
++        {
++            long current;
++            do
++            {
++                current = Interlocked.Read(ref _pooledBytes);
++                if (bytes < 0 || bytes > PoolLimit - current) return false;
++            } while (Interlocked.CompareExchange(ref _pooledBytes, current + bytes, current) != current);
++            return true;
++        }
++        public static void ReleasePool(long bytes) => Interlocked.Add(ref _pooledBytes, -bytes);
++    }
++}
+diff --git a/src/Ryujinx.Common/Logging/Logger.cs b/src/Ryujinx.Common/Logging/Logger.cs
+index 64a76a3..f08c030 100644
+--- a/src/Ryujinx.Common/Logging/Logger.cs
++++ b/src/Ryujinx.Common/Logging/Logger.cs
+@@ -39,6 +39,8 @@ namespace Ryujinx.Common.Logging
+             {
+                 if (_enabledClasses[(int)logClass])
+                 {
++                    if (Level == LogLevel.Warning) A19Probe.Add(157);
++                    if (Level == LogLevel.Error) A19Probe.Add(158);
+                     Updated?.Invoke(null, new LogEventArgs(Level, _time.Elapsed, Thread.CurrentThread.Name, FormatMessage(logClass, string.Empty, message)));
+                 }
+             }
+@@ -48,6 +50,8 @@ namespace Ryujinx.Common.Logging
+             {
+                 if (_enabledClasses[(int)logClass])
+                 {
++                    if (Level == LogLevel.Warning) A19Probe.Add(157);
++                    if (Level == LogLevel.Error) A19Probe.Add(158);
+                     Updated?.Invoke(null, new LogEventArgs(Level, _time.Elapsed, Thread.CurrentThread.Name, FormatMessage(logClass, caller, message)));
+                 }
+             }
+@@ -57,6 +61,8 @@ namespace Ryujinx.Common.Logging
+             {
+                 if (_enabledClasses[(int)logClass])
+                 {
++                    if (Level == LogLevel.Warning) A19Probe.Add(157);
++                    if (Level == LogLevel.Error) A19Probe.Add(158);
+                     Updated?.Invoke(null, new LogEventArgs(Level, _time.Elapsed, Thread.CurrentThread.Name, FormatMessage(logClass, caller, message), data));
+                 }
+             }
+@@ -67,6 +73,8 @@ namespace Ryujinx.Common.Logging
+             {
+                 if (_enabledClasses[(int)logClass])
+                 {
++                    if (Level == LogLevel.Warning) A19Probe.Add(157);
++                    if (Level == LogLevel.Error) A19Probe.Add(158);
+                     Updated?.Invoke(null, new LogEventArgs(Level, _time.Elapsed, Thread.CurrentThread.Name, FormatMessage(logClass, caller, message), new StackTrace(true)));
+                 }
+             }
+@@ -76,6 +84,8 @@ namespace Ryujinx.Common.Logging
+             {
+                 if (_enabledClasses[(int)logClass])
+                 {
++                    if (Level == LogLevel.Warning) A19Probe.Add(157);
++                    if (Level == LogLevel.Error) A19Probe.Add(158);
+                     Updated?.Invoke(null, new LogEventArgs(Level, _time.Elapsed, Thread.CurrentThread.Name, FormatMessage(logClass, caller, "Stubbed. " + message)));
+                 }
+             }
+@@ -85,6 +95,8 @@ namespace Ryujinx.Common.Logging
+             {
+                 if (_enabledClasses[(int)logClass])
+                 {
++                    if (Level == LogLevel.Warning) A19Probe.Add(157);
++                    if (Level == LogLevel.Error) A19Probe.Add(158);
+                     Updated?.Invoke(null, new LogEventArgs(Level, _time.Elapsed, Thread.CurrentThread.Name, FormatMessage(logClass, caller, "Stubbed."), data));
+                 }
+             }
+@@ -94,6 +106,8 @@ namespace Ryujinx.Common.Logging
+             {
+                 if (_enabledClasses[(int)logClass])
+                 {
++                    if (Level == LogLevel.Warning) A19Probe.Add(157);
++                    if (Level == LogLevel.Error) A19Probe.Add(158);
+                     Updated?.Invoke(null, new LogEventArgs(Level, _time.Elapsed, Thread.CurrentThread.Name, FormatMessage(logClass, caller, "Stubbed. " + message), data));
+                 }
+             }
+@@ -101,6 +115,8 @@ namespace Ryujinx.Common.Logging
+             [MethodImpl(MethodImplOptions.AggressiveInlining)]
+             public void PrintRawMsg(string message)
+             {
++                if (Level == LogLevel.Warning) A19Probe.Add(157);
++                if (Level == LogLevel.Error) A19Probe.Add(158);
+                 Updated?.Invoke(null, new LogEventArgs(Level, _time.Elapsed, Thread.CurrentThread.Name, message));
+             }
+ 
+diff --git a/src/Ryujinx.Common/Memory/MemoryOwner.cs b/src/Ryujinx.Common/Memory/MemoryOwner.cs
+index f99553d..bcb539c 100644
+--- a/src/Ryujinx.Common/Memory/MemoryOwner.cs
++++ b/src/Ryujinx.Common/Memory/MemoryOwner.cs
+@@ -82,10 +82,30 @@ namespace Ryujinx.Common.Memory
+                 return ~min;
+             }
+ 
++            private static readonly List<T[]> _a19Pool = new();
++            private static long A19Bytes(T[] array) => (long)array.Length * Unsafe.SizeOf<T>();
+             public static T[] Get(int minimumSize)
+             {
+                 lock (_lock)
+                 {
++                    if (A19Probe.Experiment(A19Trial.PoolBudget))
++                    {
++                        int best = -1;
++                        for (int i = 0; i < _a19Pool.Count; i++)
++                        {
++                            int len = _a19Pool[i].Length;
++                            if (len >= minimumSize && len <= (long)minimumSize * 2 && (best < 0 || len < _a19Pool[best].Length)) best = i;
++                        }
++                        if (best < 0) return new T[minimumSize];
++                        T[] result = _a19Pool[best];
++                        _a19Pool.RemoveAt(best);
++                        A19Trial.ReleasePool(A19Bytes(result));
++                        A19Probe.Add(74);
++                        return result;
++                    }
++                    // Drain experimental retention when baseline is selected.
++                    foreach (T[] retained in _a19Pool) A19Trial.ReleasePool(A19Bytes(retained));
++                    _a19Pool.Clear();
+                     int index = BinarySearch(_pool, minimumSize);
+ 
+                     if (index >= 0)
+@@ -105,6 +125,15 @@ namespace Ryujinx.Common.Memory
+ 
+                 lock (_lock)
+                 {
++                    if (A19Probe.Experiment(A19Trial.PoolBudget))
++                    {
++                        _pool.Clear(); // old unbounded pool is not used in this mode
++                        long bytes = A19Bytes(array);
++                        if (bytes > 4L * 1024 * 1024 || _a19Pool.Count >= 32 || !A19Trial.TryReservePool(bytes)) return;
++                        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>()) Array.Clear(array);
++                        _a19Pool.Add(array);
++                        return;
++                    }
+                     Holder holder = new(array);
+                     int i = _pool.BinarySearch(holder);
+                     if (i < 0)
+diff --git a/src/Ryujinx.Cpu/LightningJit/Translator.cs b/src/Ryujinx.Cpu/LightningJit/Translator.cs
+index 8db493c..639b84a 100644
+--- a/src/Ryujinx.Cpu/LightningJit/Translator.cs
++++ b/src/Ryujinx.Cpu/LightningJit/Translator.cs
+@@ -183,9 +183,10 @@ namespace Ryujinx.Cpu.LightningJit
+ 
+         private CompiledFunction Compile(ulong address, ExecutionMode mode)
+         {
+-            long start = A19Probe.Start();
+-            CompiledFunction compiled = AarchCompiler.Compile(CpuPresets.CortexA57, Memory, address, FunctionTable, Stubs.DispatchStub, mode, RuntimeInformation.ProcessArchitecture);
+-            A19Probe.End(start, 8, 9);
++            long start = A19Probe.Begin(8);
++            CompiledFunction compiled;
++            try { compiled = AarchCompiler.Compile(CpuPresets.CortexA57, Memory, address, FunctionTable, Stubs.DispatchStub, mode, RuntimeInformation.ProcessArchitecture); }
++            finally { A19Probe.Finish(start, 8, 9); }
+             A19Probe.Add(10, compiled.Code.Length);
+             A19Probe.Add(11, compiled.GuestCodeLength);
+             return compiled;
+diff --git a/src/Ryujinx.Graphics.GAL/Multithreading/ThreadedRenderer.cs b/src/Ryujinx.Graphics.GAL/Multithreading/ThreadedRenderer.cs
+index 66ac31a..6efb6e5 100644
+--- a/src/Ryujinx.Graphics.GAL/Multithreading/ThreadedRenderer.cs
++++ b/src/Ryujinx.Graphics.GAL/Multithreading/ThreadedRenderer.cs
+@@ -87,8 +87,9 @@ namespace Ryujinx.Graphics.GAL.Multithreading
+             Sync = new SyncMap();
+             Programs = new ProgramQueue(renderer);
+ 
+-            _galWorkAvailable = new ManualResetEventSlim(false);
+-            _invokeRun = new ManualResetEventSlim();
++            _galWorkAvailable = A19Probe.Experiment(A19Trial.IdleWait) ? new ManualResetEventSlim(false, 0) : new ManualResetEventSlim(false);
++            _invokeRun = A19Probe.Experiment(A19Trial.IdleWait) ? new ManualResetEventSlim(false, 0) : new ManualResetEventSlim();
++            if (A19Probe.Experiment(A19Trial.IdleWait)) A19Probe.Add(71);
+             _interruptRun = new AutoResetEvent(false);
+             _spanPool = new CircularSpanPool(this, SpanPoolBytes);
+             SpanPool = _spanPool;
+diff --git a/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoDevice.cs b/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoDevice.cs
+index 7d0f026..ef7dfe7 100644
+--- a/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoDevice.cs
++++ b/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoDevice.cs
+@@ -226,7 +226,7 @@ namespace Ryujinx.Graphics.Gpu.Engine.GPFifo
+                     entry.Processor.ForceAllDirty();
+                 }
+ 
+-                entry.Processor.Process(entry.EntryAddress, words);
++                entry.Processor.Process(entry.EntryAddress, words, entry.Words != null);
+             }
+ 
+             _interrupt = false;
+diff --git a/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoProcessor.cs b/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoProcessor.cs
+index c0f8ccf..2ffe952 100644
+--- a/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoProcessor.cs
++++ b/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoProcessor.cs
+@@ -1,3 +1,5 @@
++// GPFIFO replay adapted from S2Arm (Apache-2.0), revision 39d35671a57ee30d5f528c13d206fd6309a84b8f, patch 0005.
++using Ryujinx.Common;
+ using Ryujinx.Graphics.Device;
+ using Ryujinx.Graphics.Gpu.Engine.Compute;
+ using Ryujinx.Graphics.Gpu.Engine.Dma;
+@@ -7,7 +9,9 @@ using Ryujinx.Graphics.Gpu.Engine.Twod;
+ using Ryujinx.Graphics.Gpu.Image;
+ using Ryujinx.Graphics.Gpu.Memory;
+ using System;
++using System.Collections.Generic;
+ using System.Runtime.CompilerServices;
++using System.Runtime.InteropServices;
+ 
+ namespace Ryujinx.Graphics.Gpu.Engine.GPFifo
+ {
+@@ -53,6 +57,106 @@ namespace Ryujinx.Graphics.Gpu.Engine.GPFifo
+ 
+         private DmaState _state;
+ 
++        // ---- S2A：免解读缓存（命令流复用第 1 级）----
++        // 解读（DMA 状态机 + 两条快路径的判断）只依赖段内容与段开始时的 _state，是纯函数：键 = 内容哈希 + 长度 + 起始 _state。
++        // 第一次照常解读并把产生的操作按序记下（方法写入 / 内联数据整块 / 常量缓冲整块）与结束 _state；之后同键直接按记录调同样的 Send / LoadInlineData / ConstantBufferUpdate，
++        // 参数值从本段的字里取（内容相同），GPU 地址按本段基址重算（同内容的段常在不同地址：命令环）。解读中抛异常的段不进缓存。
++        private struct S2AOp
++        {
++            public byte Kind; // 0 方法写入（值取本段第 Index 个字），1 内联数据整块，2 常量缓冲整块，3 立即数方法写入（值在 Count）
++            public bool IsLast;
++            public int Index, Method, Sub, Count;
++        }
++
++        private sealed class S2ASeg
++        {
++            public int Len;
++            public int[] Words;
++            public DmaState Start, End;
++            public S2AOp[] Ops;
++        }
++
++        private const int S2ASegMinLen = 8, S2ASegCap = 128, S2ASegMaxWords = 512;
++        private int _a19Trials, _a19Hits, _a19Skip;
++        private Dictionary<ulong, S2ASeg> _s2aSegs;
++
++        // Admit a segment on its second observation.
++        private const int S2ASeenBits = 16;
++        private ulong[] _s2aSeen;
++        private List<S2AOp> _s2aRec;
++        private List<S2AOp> _s2aRecBuf; // S2A：记录用的表复用；存进缓存时 ToArray
++
++        private static bool S2AStateEq(in DmaState a, in DmaState b) =>
++            a.Method == b.Method && a.SubChannel == b.SubChannel && a.MethodCount == b.MethodCount && a.NonIncrementing == b.NonIncrementing && a.IncrementOnce == b.IncrementOnce;
++
++        private static ulong S2AHash(ReadOnlySpan<int> words, in DmaState st)
++        {
++            ulong h = 0xcbf29ce484222325UL ^ (ulong)words.Length;
++            h = (h ^ (uint)st.Method) * 0x100000001b3UL;
++            h = (h ^ (uint)st.SubChannel) * 0x100000001b3UL;
++            h = (h ^ (uint)st.MethodCount) * 0x100000001b3UL;
++            h = (h ^ (st.NonIncrementing ? 1UL : 0) ^ (st.IncrementOnce ? 2UL : 0)) * 0x100000001b3UL;
++            ReadOnlySpan<ulong> q = MemoryMarshal.Cast<int, ulong>(words);
++            for (int i = 0; i < q.Length; i++)
++            {
++                h = (h ^ q[i]) * 0x100000001b3UL;
++                h ^= h >> 29;
++            }
++
++            if ((words.Length & 1) != 0)
++            {
++                h = (h ^ (uint)words[^1]) * 0x100000001b3UL;
++            }
++
++            return h;
++        }
++
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        private void S2ARecOp(byte kind, int index, int method, int sub, int count, bool isLast)
++        {
++            _s2aRec?.Add(new S2AOp { Kind = kind, Index = index, Method = method, Sub = sub, Count = count, IsLast = isLast });
++        }
++
++        private void S2AReplay(ulong baseGpuVa, ReadOnlySpan<int> cb, S2ASeg seg)
++        {
++            S2AOp[] ops = seg.Ops;
++            for (int i = 0; i < ops.Length; i++)
++            {
++                ref readonly S2AOp op = ref ops[i];
++                switch (op.Kind)
++                {
++                    case 0:
++                        Send(baseGpuVa + (ulong)op.Index * 4, op.Method, cb[op.Index], op.Sub, op.IsLast);
++                        break;
++                    case 3:
++                        Send(baseGpuVa + (ulong)op.Index * 4, op.Method, op.Count, op.Sub, true);
++                        break;
++                    case 1:
++                        ReadOnlySpan<int> data = cb.Slice(op.Index, op.Count);
++                        if (op.Sub == 0)
++                        {
++                            _3dClass.LoadInlineData(data);
++                        }
++                        else if (op.Sub == 1)
++                        {
++                            _computeClass.LoadInlineData(data);
++                        }
++                        else
++                        {
++                            _i2mClass.LoadInlineData(data);
++                        }
++
++                        break;
++                    case 2:
++                        _3dClass.ConstantBufferUpdate(cb.Slice(op.Index, op.Count));
++                        break;
++                }
++            }
++
++            _state = seg.End;
++            _3dClass.FlushUboDirty();
++        }
++
+         private readonly ThreedClass _3dClass;
+         private readonly ComputeClass _computeClass;
+         private readonly InlineToMemoryClass _i2mClass;
+@@ -83,7 +187,67 @@ namespace Ryujinx.Graphics.Gpu.Engine.GPFifo
+         /// </summary>
+         /// <param name="baseGpuVa">Base GPU virtual address of the command buffer</param>
+         /// <param name="commandBuffer">Command buffer</param>
+-        public void Process(ulong baseGpuVa, ReadOnlySpan<int> commandBuffer)
++        public void Process(ulong baseGpuVa, ReadOnlySpan<int> commandBuffer, bool stablePrefetch = false)
++        {
++            if (!stablePrefetch || !A19Probe.Experiment(A19Trial.CommandReuse) || commandBuffer.Length < S2ASegMinLen || commandBuffer.Length > S2ASegMaxWords || _a19Skip > 0)
++            {
++                if (_a19Skip > 0) _a19Skip--;
++                ProcessCore(baseGpuVa, commandBuffer);
++                return;
++            }
++            // Only immutable, privately prefetched words qualify. No snapshot or replay of live guest memory.
++            ReadOnlySpan<int> words = commandBuffer;
++            _s2aSeen ??= new ulong[1 << S2ASeenBits];
++            _s2aSegs ??= new();
++            _s2aRecBuf ??= new();
++            if (++_a19Trials >= 256)
++            {
++                if (_a19Hits * 8 < _a19Trials) _a19Skip = 1024;
++                _a19Trials = 0; _a19Hits = 0;
++            }
++            ulong key = S2AHash(words, _state);
++            DmaState start = _state;
++
++            if (_s2aSegs.TryGetValue(key, out S2ASeg seg) && seg.Len == words.Length && S2AStateEq(seg.Start, start) && words.SequenceEqual(seg.Words))
++            {
++                _a19Hits++;
++                A19Probe.Add(78);
++                S2AReplay(baseGpuVa, words, seg);
++                return;
++            }
++
++            ref ulong seen = ref _s2aSeen[(int)(key >> (64 - S2ASeenBits))];
++            if (seen != key)
++            {
++                seen = key;
++                ProcessCore(baseGpuVa, words);
++                return;
++            }
++
++            _s2aRec = _s2aRecBuf;
++            _s2aRec.Clear();
++
++            try
++            {
++                ProcessCore(baseGpuVa, words);
++            }
++            finally
++            {
++                _s2aRec = null;
++            }
++
++            if (_s2aSegs.Count >= S2ASegCap)
++            {
++                _s2aSegs.Clear();
++            }
++
++            _s2aSegs[key] = new S2ASeg { Len = words.Length, Words = words.ToArray(), Start = start, End = _state, Ops = _s2aRecBuf.ToArray() };
++        }
++
++        /// <summary>
++        /// S2A: 原 Process 主体（逐字解读），解读中顺带给免解读缓存记录操作。
++        /// </summary>
++        private void ProcessCore(ulong baseGpuVa, ReadOnlySpan<int> commandBuffer)
+         {
+             for (int index = 0; index < commandBuffer.Length; index++)
+             {
+@@ -98,6 +262,7 @@ namespace Ryujinx.Graphics.Gpu.Engine.GPFifo
+                         continue;
+                     }
+ 
++                    S2ARecOp(0, index, _state.Method, _state.SubChannel, 0, _state.MethodCount <= 1); // S2A：免解读缓存记录
+                     Send(gpuVa, _state.Method, command, _state.SubChannel, _state.MethodCount <= 1);
+ 
+                     if (!_state.NonIncrementing)
+@@ -134,6 +299,7 @@ namespace Ryujinx.Graphics.Gpu.Engine.GPFifo
+                             _state.NonIncrementing = meth.SecOp == SecOp.NonIncMethod;
+                             break;
+                         case SecOp.ImmdDataMethod:
++                            S2ARecOp(3, index, meth.MethodAddress, meth.MethodSubchannel, meth.ImmdData, true); // S2A：立即数方法，值在 Count 里
+                             Send(gpuVa, meth.MethodAddress, meth.ImmdData, meth.MethodSubchannel, true);
+                             break;
+                     }
+@@ -161,6 +327,8 @@ namespace Ryujinx.Graphics.Gpu.Engine.GPFifo
+ 
+                 ReadOnlySpan<int> data = commandBuffer.Slice(offset, consumeCount);
+ 
++                S2ARecOp(1, offset, 0, _state.SubChannel, consumeCount, false); // S2A：免解读缓存记录
++
+                 if (_state.SubChannel == 0)
+                 {
+                     _3dClass.LoadInlineData(data);
+@@ -201,6 +369,7 @@ namespace Ryujinx.Graphics.Gpu.Engine.GPFifo
+                 meth.MethodCount < availableCount &&
+                 meth.SecOp == SecOp.NonIncMethod)
+             {
++                S2ARecOp(2, offset + 1, 0, 0, meth.MethodCount, false); // S2A：免解读缓存记录
+                 _3dClass.ConstantBufferUpdate(commandBuffer.Slice(offset + 1, meth.MethodCount));
+ 
+                 return true;
+diff --git a/src/Ryujinx.Graphics.Gpu/Image/AutoDeleteCache.cs b/src/Ryujinx.Graphics.Gpu/Image/AutoDeleteCache.cs
+index 99b3411..7473968 100644
+--- a/src/Ryujinx.Graphics.Gpu/Image/AutoDeleteCache.cs
++++ b/src/Ryujinx.Graphics.Gpu/Image/AutoDeleteCache.cs
+@@ -1,3 +1,4 @@
++using Ryujinx.Common;
+ using Ryujinx.Common.Logging;
+ using System;
+ using System.Collections;
+@@ -59,6 +60,14 @@ namespace Ryujinx.Graphics.Gpu.Image
+         private const float MemoryScaleFactor = 0.50f;
+         private ulong _maxCacheMemoryUsage = DefaultTextureSizeCapacity;
+ 
++        private ulong A19TextureLimit()
++        {
++            if (!A19Probe.Experiment(A19Trial.TextureBudget)) return _maxCacheMemoryUsage;
++            const ulong MiB = 1024 * 1024;
++            long available = A19Trial.AvailableBytes;
++            ulong target = available < 0 ? 768 * MiB : available < 256L * (long)MiB ? 256 * MiB : available < 768L * (long)MiB ? 512 * MiB : 1024 * MiB;
++            return Math.Min(target, _maxCacheMemoryUsage);
++        }
+         private readonly LinkedList<Texture> _textures;
+         private ulong _totalSize;
+ 
+@@ -135,7 +144,7 @@ namespace Ryujinx.Graphics.Gpu.Image
+             texture.CacheNode = _textures.AddLast(texture);
+ 
+             if (_textures.Count > MaxCapacity ||
+-                (_totalSize > _maxCacheMemoryUsage && _textures.Count >= MinCountForDeletion))
++                (_totalSize > A19TextureLimit() && _textures.Count >= MinCountForDeletion))
+             {
+                 RemoveLeastUsedTexture();
+             }
+@@ -160,7 +169,7 @@ namespace Ryujinx.Graphics.Gpu.Image
+                     _textures.AddLast(texture.CacheNode);
+                 }
+ 
+-                if (_totalSize > _maxCacheMemoryUsage && _textures.Count >= MinCountForDeletion)
++                if (_totalSize > A19TextureLimit() && _textures.Count >= MinCountForDeletion)
+                 {
+                     RemoveLeastUsedTexture();
+                 }
+@@ -176,6 +185,7 @@ namespace Ryujinx.Graphics.Gpu.Image
+         /// </summary>
+         private void RemoveLeastUsedTexture()
+         {
++            if (A19Probe.Experiment(A19Trial.TextureBudget)) A19Probe.Add(75);
+             Texture oldestTexture = _textures.First.Value;
+ 
+             _totalSize -= oldestTexture.Size;
+@@ -332,6 +342,12 @@ namespace Ryujinx.Graphics.Gpu.Image
+             toRemove.Clear();
+             _shortCache = _shortCacheBuilder;
+             _shortCacheBuilder = toRemove;
++            if (A19Probe.Experiment(A19Trial.TextureBudget))
++            {
++                ulong limit = A19TextureLimit();
++                for (int i = 0; i < 2 && _textures.Count >= MinCountForDeletion && _totalSize > limit; i++)
++                    RemoveLeastUsedTexture();
++            }
+         }
+ 
+         public IEnumerator<Texture> GetEnumerator()
+diff --git a/src/Ryujinx.Graphics.Gpu/Memory/BufferCache.cs b/src/Ryujinx.Graphics.Gpu/Memory/BufferCache.cs
+index 83869ed..36cbf41 100644
+--- a/src/Ryujinx.Graphics.Gpu/Memory/BufferCache.cs
++++ b/src/Ryujinx.Graphics.Gpu/Memory/BufferCache.cs
+@@ -1,3 +1,4 @@
++using Ryujinx.Common;
+ using Ryujinx.Graphics.GAL;
+ using Ryujinx.Memory.Range;
+ using System;
+@@ -39,6 +40,27 @@ namespace Ryujinx.Graphics.Gpu.Memory
+         /// Must lock for any access from other threads.
+         /// </remarks>
+         private readonly NonOverlappingRangeList<Buffer> _buffers;
++        // Bounded recent-hit table. Only used by the GPU thread, like the range list.
++        private readonly Buffer[] _a19Recent = A19Probe.Experiment(A19Trial.BufferLookup) ? new Buffer[1024] : null;
++        private void A19InvalidateLookup()
++        {
++            if (_a19Recent != null) Array.Clear(_a19Recent);
++        }
++        private Buffer A19FindBuffer(ulong address, ulong size)
++        {
++            if (_a19Recent == null) return _buffers.FindOverlap(address, size);
++            int index = (int)((address >> 12) & 1023);
++            Buffer hit = _a19Recent[index];
++            if (hit != null && address >= hit.Address && address <= hit.EndAddress && size <= hit.EndAddress - address)
++            {
++                A19Probe.Add(67);
++                return hit;
++            }
++            Buffer found = _buffers.FindOverlap(address, size);
++            if (found != null && address >= found.Address && address <= found.EndAddress && size <= found.EndAddress - address)
++                _a19Recent[index] = found;
++            return found;
++        }
+         private readonly MultiRangeList<MultiRangeBuffer> _multiRangeBuffers;
+ 
+         private readonly Dictionary<ulong, BufferCacheEntry> _dirtyCache;
+@@ -518,6 +540,12 @@ namespace Ryujinx.Graphics.Gpu.Memory
+                         ulong existingSize = overlaps[0].Size;
+                         ulong growthSize = (existingSize + Math.Min(existingSize >> 1, MaxDynamicGrowthSize)) & ~BufferAlignmentMask;
+ 
++                        if (A19Probe.Experiment(A19Trial.MappedGrowth) && growthSize > size &&
++                            !_physicalMemory.A19IsRangeMapped(address, growthSize))
++                        {
++                            A19Probe.Add(68);
++                            growthSize = size;
++                        }
+                         size = Math.Max(size, growthSize);
+                         endAddress = address + size;
+ 
+@@ -534,16 +562,19 @@ namespace Ryujinx.Graphics.Gpu.Memory
+ 
+                     Buffer[] overlapsArray = overlaps.ToArray();
+                     
++                    A19InvalidateLookup();
+                     _buffers.RemoveRange(overlaps[0], overlaps[^1]);
+                     
+                     ulong newSize = endAddress - address;
+ 
++                    A19InvalidateLookup();
+                     _buffers.Add(CreateBufferAligned(address, newSize, stage, anySparseCompatible, overlapsArray));
+                 }
+             }
+             else
+             {
+                 // No overlap, just create a new buffer.
++                A19InvalidateLookup();
+                 _buffers.Add(new(_context, _physicalMemory, address, size, stage, sparseCompatible: false, []));
+             }
+         }
+@@ -599,14 +630,17 @@ namespace Ryujinx.Graphics.Gpu.Memory
+                     
+                     Buffer[] overlapsArray = overlaps.ToArray();
+                     
++                    A19InvalidateLookup();
+                     _buffers.RemoveRange(overlaps[0], overlaps[^1]);
+                     
++                    A19InvalidateLookup();
+                     _buffers.Add(CreateBufferAligned(address, newSize, stage, sparseAligned, overlapsArray));
+                 }
+             }
+             else
+             {
+                 // No overlap, just create a new buffer.
++                A19InvalidateLookup();
+                 _buffers.Add(new(_context, _physicalMemory, address, size, stage, sparseAligned, []));
+             } 
+         }
+@@ -903,7 +937,7 @@ namespace Ryujinx.Graphics.Gpu.Memory
+ 
+             if (size != 0)
+             {
+-                buffer = _buffers.FindOverlap(address, size);
++                buffer = A19FindBuffer(address, size);
+ 
+                 buffer.CopyFromDependantVirtualBuffers();
+                 buffer.SynchronizeMemory(address, size);
+@@ -953,7 +987,7 @@ namespace Ryujinx.Graphics.Gpu.Memory
+         {
+             if (size != 0)
+             {
+-                Buffer buffer = _buffers.FindOverlap(address, size);
++                Buffer buffer = A19FindBuffer(address, size);
+ 
+                 if (copyBackVirtual)
+                 {
+@@ -1032,6 +1066,7 @@ namespace Ryujinx.Graphics.Gpu.Memory
+         {
+             lock (_buffers)
+             {
++                A19InvalidateLookup();
+                 foreach (Buffer buffer in _buffers)
+                 {
+                     buffer.Dispose();
+diff --git a/src/Ryujinx.Graphics.Gpu/Memory/BufferManager.cs b/src/Ryujinx.Graphics.Gpu/Memory/BufferManager.cs
+index 73647be..57924ee 100644
+--- a/src/Ryujinx.Graphics.Gpu/Memory/BufferManager.cs
++++ b/src/Ryujinx.Graphics.Gpu/Memory/BufferManager.cs
+@@ -320,6 +320,12 @@ namespace Ryujinx.Graphics.Gpu.Memory
+         {
+             MultiRange range = _channel.MemoryManager.Physical.BufferCache.TranslateAndCreateBuffer(_channel.MemoryManager, gpuVa, size, BufferStageUtils.FromShaderStage(stage));
+ 
++            if (A19Probe.Experiment(A19Trial.UniformReuse) &&
++                _gpUniformBuffers[stage].Buffers[index].Equals(new BufferBounds(range)))
++            {
++                A19Probe.Add(69);
++                return;
++            }
+             _gpUniformBuffers[stage].SetBounds(index, range);
+             _gpUniformBuffersDirty = true;
+         }
+diff --git a/src/Ryujinx.Graphics.Gpu/Memory/PhysicalMemory.cs b/src/Ryujinx.Graphics.Gpu/Memory/PhysicalMemory.cs
+index 0b1424b..7d291e5 100644
+--- a/src/Ryujinx.Graphics.Gpu/Memory/PhysicalMemory.cs
++++ b/src/Ryujinx.Graphics.Gpu/Memory/PhysicalMemory.cs
+@@ -29,6 +29,8 @@ namespace Ryujinx.Graphics.Gpu.Memory
+         /// </summary>
+         public ShaderCache ShaderCache { get; }
+ 
++        internal bool A19IsRangeMapped(ulong address, ulong size) => _cpuMemory.IsRangeMapped(address, size);
++
+         /// <summary>
+         /// GPU buffer manager.
+         /// </summary>
+diff --git a/src/Ryujinx.Graphics.Gpu/Shader/ShaderCache.cs b/src/Ryujinx.Graphics.Gpu/Shader/ShaderCache.cs
+index b6d8327..a4557af 100644
+--- a/src/Ryujinx.Graphics.Gpu/Shader/ShaderCache.cs
++++ b/src/Ryujinx.Graphics.Gpu/Shader/ShaderCache.cs
+@@ -1,3 +1,4 @@
++using Ryujinx.Common;
+ using Ryujinx.Common.Configuration;
+ using Ryujinx.Common.Logging;
+ using Ryujinx.Common.Memory;
+@@ -129,6 +130,23 @@ namespace Ryujinx.Graphics.Gpu.Shader
+         {
+             // Check to see if the binaries for previously compiled shaders are ready, and save them out.
+ 
++            if (A19Probe.Experiment(A19Trial.ShaderSaveQueue))
++            {
++                int pending = Math.Min(_programsToSaveQueue.Count, 8);
++                for (int i = 0; i < pending; i++)
++                {
++                    ProgramToSave item = _programsToSaveQueue.Dequeue();
++                    ProgramLinkStatus status = item.HostProgram.CheckProgramLink(false);
++                    if (status == ProgramLinkStatus.Incomplete)
++                    {
++                        _programsToSaveQueue.Enqueue(item);
++                        A19Probe.Add(70);
++                    }
++                    else if (status == ProgramLinkStatus.Success)
++                        _cacheWriter.AddShader(item.CachedProgram, item.BinaryCode ?? item.HostProgram.GetBinary());
++                }
++                return;
++            }
+             while (_programsToSaveQueue.TryPeek(out ProgramToSave programToSave))
+             {
+                 ProgramLinkStatus result = programToSave.HostProgram.CheckProgramLink(false);
+diff --git a/src/Ryujinx.Graphics.Gpu/Synchronization/SynchronizationManager.cs b/src/Ryujinx.Graphics.Gpu/Synchronization/SynchronizationManager.cs
+index d51b0ef..e03f2f2 100644
+--- a/src/Ryujinx.Graphics.Gpu/Synchronization/SynchronizationManager.cs
++++ b/src/Ryujinx.Graphics.Gpu/Synchronization/SynchronizationManager.cs
+@@ -1,3 +1,4 @@
++using Ryujinx.Common;
+ using Ryujinx.Common.Logging;
+ using Ryujinx.Graphics.Device;
+ using System;
+@@ -86,6 +87,11 @@ namespace Ryujinx.Graphics.Gpu.Synchronization
+                 timeout = TimeSpan.FromSeconds(1);
+             }
+ 
++            if (A19Probe.Experiment(A19Trial.FenceFast) && _syncpoints[id].A19Reached(threshold))
++            {
++                A19Probe.Add(72);
++                return false;
++            }
+             using ManualResetEvent waitEvent = new(false);
+             SyncpointWaiterHandle info = _syncpoints[id].RegisterCallback(threshold, _ => waitEvent.Set());
+ 
+diff --git a/src/Ryujinx.Graphics.Gpu/Synchronization/Syncpoint.cs b/src/Ryujinx.Graphics.Gpu/Synchronization/Syncpoint.cs
+index b2e0abf..f5309b0 100644
+--- a/src/Ryujinx.Graphics.Gpu/Synchronization/Syncpoint.cs
++++ b/src/Ryujinx.Graphics.Gpu/Synchronization/Syncpoint.cs
+@@ -59,6 +59,11 @@ namespace Ryujinx.Graphics.Gpu.Synchronization
+             }
+         }
+ 
++        public bool A19Reached(uint threshold)
++        {
++            lock (_waiters) return Value >= threshold;
++        }
++
+         public void UnregisterCallback(SyncpointWaiterHandle waiterInformation)
+         {
+             lock (_waiters)
+diff --git a/src/Ryujinx.Graphics.Vulkan/BackgroundCompilationScheduler.cs b/src/Ryujinx.Graphics.Vulkan/BackgroundCompilationScheduler.cs
+index 0f46753..5e3c3ba 100644
+--- a/src/Ryujinx.Graphics.Vulkan/BackgroundCompilationScheduler.cs
++++ b/src/Ryujinx.Graphics.Vulkan/BackgroundCompilationScheduler.cs
+@@ -15,7 +15,7 @@ namespace Ryujinx.Graphics.Vulkan
+         public BackgroundCompilationScheduler()
+         {
+             _shaderQueue = new("Shader", GetBackgroundShaderCompileThreadCount());
+-            _pipelineQueue = new("Pipeline", 1);
++            _pipelineQueue = new("Pipeline", A19Probe.Experiment(A19Trial.IsolatedPipelines) ? 2 : 1);
+         }
+ 
+         private static int GetBackgroundShaderCompileThreadCount()
+@@ -83,6 +83,7 @@ namespace Ryujinx.Graphics.Vulkan
+                     }
+                     catch (Exception ex)
+                     {
++                        A19Probe.Add(156);
+                         Completion.TrySetException(ex);
+                     }
+                 }
+@@ -101,6 +102,7 @@ namespace Ryujinx.Graphics.Vulkan
+             private readonly string _name;
+ 
+             private bool _stopping;
++            private int _a19Active;
+ 
+             public WorkerQueue(string name, int workerCount)
+             {
+@@ -132,10 +134,12 @@ namespace Ryujinx.Graphics.Vulkan
+                     if (highPriority)
+                     {
+                         _highPriorityQueue.Enqueue(item);
++                        A19Probe.Add(166);
+                     }
+                     else
+                     {
+                         _lowPriorityQueue.Enqueue(item);
++                        A19Probe.Add(166);
+                     }
+                 }
+ 
+@@ -150,37 +154,36 @@ namespace Ryujinx.Graphics.Vulkan
+                 while (true)
+                 {
+                     _signal.Wait();
+-
+                     WorkItem item;
+-
++                    bool delay;
+                     lock (_queueLock)
+                     {
+-                        if (_highPriorityQueue.Count != 0)
+-                        {
+-                            item = _highPriorityQueue.Dequeue();
+-                        }
+-                        else if (_lowPriorityQueue.Count != 0)
+-                        {
+-                            item = _lowPriorityQueue.Dequeue();
+-                        }
+-                        else if (_stopping)
+-                        {
+-                            return;
+-                        }
+-                        else
+-                        {
+-                            continue;
+-                        }
++                        if (_highPriorityQueue.Count != 0) item = _highPriorityQueue.Dequeue();
++                        else if (_lowPriorityQueue.Count != 0) item = _lowPriorityQueue.Dequeue();
++                        else if (_stopping) return;
++                        else continue;
++                        delay = A19Probe.Experiment(A19Trial.ThermalCompile) && !item.HighPriority && _a19Active > 0 && A19Trial.Thermal >= 2;
++                        A19Probe.Add(166, -1);
++                        _a19Active++;
++                    }
++                    // Limit admission pressure with a bounded delay, never starve work the game may require.
++                    if (delay)
++                    {
++                        A19Probe.Add(77);
++                        Thread.Sleep(A19Trial.Thermal >= 3 ? 24 : 12);
+                     }
+-
+                     if (lastQos != item.HighPriority)
+                     {
+                         ApplyQos(item.HighPriority);
+                         lastQos = item.HighPriority;
+                     }
+-                    long workStart = A19Probe.Start();
+-                    item.Execute();
+-                    A19Probe.End(workStart, 27, 28);
++                    long workStart = A19Probe.Begin(27);
++                    try { item.Execute(); }
++                    finally
++                    {
++                        lock (_queueLock) _a19Active--;
++                        A19Probe.Finish(workStart, 27, 28);
++                    }
+                 }
+             }
+ 
+@@ -195,11 +198,13 @@ namespace Ryujinx.Graphics.Vulkan
+                     while (_highPriorityQueue.TryDequeue(out WorkItem highItem))
+                     {
+                         pending.Add(highItem);
++                        A19Probe.Add(166, -1);
+                     }
+ 
+                     while (_lowPriorityQueue.TryDequeue(out WorkItem lowItem))
+                     {
+                         pending.Add(lowItem);
++                        A19Probe.Add(166, -1);
+                     }
+                 }
+ 
+diff --git a/src/Ryujinx.Graphics.Vulkan/CommandBufferPool.cs b/src/Ryujinx.Graphics.Vulkan/CommandBufferPool.cs
+index 5faaaf4..229313f 100644
+--- a/src/Ryujinx.Graphics.Vulkan/CommandBufferPool.cs
++++ b/src/Ryujinx.Graphics.Vulkan/CommandBufferPool.cs
+@@ -312,9 +312,9 @@ namespace Ryujinx.Graphics.Vulkan
+ 
+                         lock (_queueLock)
+                         {
+-                            long submitStart = A19Probe.Start();
+-                            _api.QueueSubmit(_queue, 1, in sInfo, entry.Fence.GetUnsafe()).ThrowOnError();
+-                            A19Probe.End(submitStart, 21, 22);
++                            long submitStart = A19Probe.Begin(21);
++                            try { _api.QueueSubmit(_queue, 1, in sInfo, entry.Fence.GetUnsafe()).ThrowOnError(); }
++                            finally { A19Probe.Finish(submitStart, 21, 22); }
+                         }
+                     }
+                 }
+@@ -331,9 +331,9 @@ namespace Ryujinx.Graphics.Vulkan
+ 
+             if (entry.InConsumption)
+             {
+-                long waitStart = A19Probe.Start();
+-                entry.Fence.Wait();
+-                A19Probe.End(waitStart, 19, 20);
++                long waitStart = A19Probe.Begin(19);
++                try { entry.Fence.Wait(); }
++                finally { A19Probe.Finish(waitStart, 19, 20); }
+                 entry.InConsumption = false;
+             }
+ 
+diff --git a/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs b/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs
+index 26a9bc8..3245d0c 100644
+--- a/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs
++++ b/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs
+@@ -35,13 +35,15 @@ namespace Ryujinx.Graphics.Vulkan
+             int memoryTypeIndex = FindSuitableMemoryTypeIndex(requirements.MemoryTypeBits, flags);
+             if (memoryTypeIndex < 0)
+             {
++                A19Probe.Add(170);
+                 return default;
+             }
+ 
+             bool map = flags.HasFlag(MemoryPropertyFlags.HostVisibleBit);
+-            long allocationStart = A19Probe.Start();
+-            MemoryAllocation allocation = Allocate(memoryTypeIndex, requirements.Size, requirements.Alignment, map, isBuffer);
+-            A19Probe.End(allocationStart, 40, 42);
++            long allocationStart = A19Probe.Begin(40);
++            MemoryAllocation allocation;
++            try { allocation = Allocate(memoryTypeIndex, requirements.Size, requirements.Alignment, map, isBuffer); }
++            finally { A19Probe.Finish(allocationStart, 40, 42); }
+             A19Probe.Add(41, (long)Math.Min(requirements.Size, (ulong)long.MaxValue));
+             return allocation;
+         }
+diff --git a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
+index 1a8cd54..0484a9a 100644
+--- a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
++++ b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
+@@ -19,6 +19,9 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+         [LibraryImport("libMoltenVK.dylib")]
+         private static partial Result vkSetMoltenVKConfigurationMVK(nint unusedInstance, in MVKConfiguration config, ref nint configSize);
+ 
++        // MoltenVK configuration is process-global. Snapshot defaults before the first trial.
++        private static (uint CommandLimit, Bool32 Tracking, uint LoggingCount, uint InlineLogging)? _originalIosConfig;
++
+         public static void Initialize()
+         {
+             A19Probe.Set(44, -104); // no native statistics sampled for this device yet
+@@ -43,8 +46,15 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+ 
+             if (OperatingSystem.IsIOS())
+             {
++                _originalIosConfig ??= (config.MaxActiveMetalCommandBuffersPerQueue, config.PerformanceTracking,
++                    config.PerformanceLoggingFrameCount, config.LogActivityPerformanceInline);
++                var original = _originalIosConfig.Value;
+                 if (A19Probe.ArgumentBuffers != 0) config.UseMetalArgumentBuffers = A19Probe.ArgumentBuffers == 1 ? 1u : 0u;
+-                if (A19Probe.CommandLimit != 0) config.MaxActiveMetalCommandBuffersPerQueue = (uint)A19Probe.CommandLimit;
++                config.MaxActiveMetalCommandBuffersPerQueue = A19Probe.CommandLimit != 0
++                    ? (uint)A19Probe.CommandLimit : original.CommandLimit;
++                config.PerformanceTracking = original.Tracking;
++                config.PerformanceLoggingFrameCount = original.LoggingCount;
++                config.LogActivityPerformanceInline = original.InlineLogging;
+                 if (A19Probe.Enabled)
+                 {
+                     config.PerformanceTracking = true;
+diff --git a/src/Ryujinx.Graphics.Vulkan/PipelineState.cs b/src/Ryujinx.Graphics.Vulkan/PipelineState.cs
+index e903c38..edfce9e 100644
+--- a/src/Ryujinx.Graphics.Vulkan/PipelineState.cs
++++ b/src/Ryujinx.Graphics.Vulkan/PipelineState.cs
+@@ -394,13 +394,26 @@ namespace Ryujinx.Graphics.Vulkan
+ 
+                 Result result;
+ 
+-                lock (gd.PipelineCreationLock)
++                if (A19Probe.Experiment(A19Trial.IsolatedPipelines))
+                 {
+-                    long pipelineStart = A19Probe.Start();
+-                    result = gd.Api.CreateComputePipelines(device, cache, 1, &pipelineCreateInfo, null, &pipelineHandle);
+-                    A19Probe.End(pipelineStart, 23, 24);
++                    long pipelineStart = A19Probe.Begin(23);
++                    try { result = gd.Api.CreateComputePipelines(device, default, 1, &pipelineCreateInfo, null, &pipelineHandle); }
++                    finally { A19Probe.Finish(pipelineStart, 23, 24); }
++                    A19Probe.Add(76);
++                }
++                else
++                {
++                    long lockStart = A19Probe.Begin(151);
++                    lock (gd.PipelineCreationLock)
++                    {
++                        A19Probe.Finish(lockStart, 151, 152);
++                        long pipelineStart = A19Probe.Begin(23);
++                        try { result = gd.Api.CreateComputePipelines(device, cache, 1, &pipelineCreateInfo, null, &pipelineHandle); }
++                        finally { A19Probe.Finish(pipelineStart, 23, 24); }
++                    }
+                 }
+ 
++                if (result.IsError) { A19Probe.Add(155); A19Probe.Set(169, (int)result); }
+                 if (throwOnError)
+                 {
+                     result.ThrowOnError();
+@@ -696,13 +709,26 @@ namespace Ryujinx.Graphics.Vulkan
+ 
+                 Result result;
+ 
+-                lock (gd.PipelineCreationLock)
++                if (A19Probe.Experiment(A19Trial.IsolatedPipelines))
+                 {
+-                    long pipelineStart = A19Probe.Start();
+-                    result = gd.Api.CreateGraphicsPipelines(device, cache, 1, &pipelineCreateInfo, null, &pipelineHandle);
+-                    A19Probe.End(pipelineStart, 23, 24);
++                    long pipelineStart = A19Probe.Begin(23);
++                    try { result = gd.Api.CreateGraphicsPipelines(device, default, 1, &pipelineCreateInfo, null, &pipelineHandle); }
++                    finally { A19Probe.Finish(pipelineStart, 23, 24); }
++                    A19Probe.Add(76);
++                }
++                else
++                {
++                    long lockStart = A19Probe.Begin(151);
++                    lock (gd.PipelineCreationLock)
++                    {
++                        A19Probe.Finish(lockStart, 151, 152);
++                        long pipelineStart = A19Probe.Begin(23);
++                        try { result = gd.Api.CreateGraphicsPipelines(device, cache, 1, &pipelineCreateInfo, null, &pipelineHandle); }
++                        finally { A19Probe.Finish(pipelineStart, 23, 24); }
++                    }
+                 }
+ 
++                if (result.IsError) { A19Probe.Add(155); A19Probe.Set(169, (int)result); }
+                 if (throwOnError)
+                 {
+                     result.ThrowOnError();
+diff --git a/src/Ryujinx.HLE/HOS/Kernel/Threading/KScheduler.cs b/src/Ryujinx.HLE/HOS/Kernel/Threading/KScheduler.cs
+index 330624b..94669fe 100644
+--- a/src/Ryujinx.HLE/HOS/Kernel/Threading/KScheduler.cs
++++ b/src/Ryujinx.HLE/HOS/Kernel/Threading/KScheduler.cs
+@@ -467,7 +467,10 @@ namespace Ryujinx.HLE.HOS.Kernel.Threading
+                 nextThread = context.PriorityQueue.Reschedule(prio, core, selectedThread);
+             }
+ 
+-            static KThread FirstSuitableCandidateOrDefault(KernelContext context, int core, KThread selectedThread, KThread nextThread, Predicate<KThread> predicate)
++            static Predicate<KThread> EqualPriority(int priority) => x => x.DynamicPriority == priority;
++            static Predicate<KThread> LowerPriority(KThread thread) => x => x.DynamicPriority < thread.DynamicPriority;
++
++            static KThread FirstSuitableCandidateOrDefault(KernelContext context, int core, KThread selectedThread, KThread nextThread, Predicate<KThread> predicate, int priority = 0, bool lowerOnly = false)
+             {
+                 foreach (KThread suggested in context.PriorityQueue.SuggestedThreads(core))
+                 {
+@@ -487,7 +490,7 @@ namespace Ryujinx.HLE.HOS.Kernel.Threading
+                         nextThread == null ||
+                         nextThread.LastScheduledTime >= suggested.LastScheduledTime)
+                     {
+-                        if (predicate(suggested))
++                        if (predicate != null ? predicate(suggested) : (lowerOnly ? suggested.DynamicPriority < priority : suggested.DynamicPriority == priority))
+                         {
+                             return suggested;
+                         }
+@@ -499,7 +502,10 @@ namespace Ryujinx.HLE.HOS.Kernel.Threading
+ 
+             // Select candidate threads that could run on this core.
+             // Only take into account threads that are not yet selected.
+-            KThread dst = FirstSuitableCandidateOrDefault(context, core, selectedThread, nextThread, x => x.DynamicPriority == prio);
++            if (A19Probe.Experiment(A19Trial.SchedulerAlloc)) A19Probe.Add(73);
++            KThread dst = A19Probe.Experiment(A19Trial.SchedulerAlloc)
++                ? FirstSuitableCandidateOrDefault(context, core, selectedThread, nextThread, null, prio)
++                : FirstSuitableCandidateOrDefault(context, core, selectedThread, nextThread, EqualPriority(prio));
+ 
+             if (dst != null)
+             {
+@@ -512,7 +518,9 @@ namespace Ryujinx.HLE.HOS.Kernel.Threading
+ 
+             if (bestCandidate != null && bestCandidate.DynamicPriority >= prio)
+             {
+-                dst = FirstSuitableCandidateOrDefault(context, core, selectedThread, nextThread, x => x.DynamicPriority < bestCandidate.DynamicPriority);
++                dst = A19Probe.Experiment(A19Trial.SchedulerAlloc)
++                    ? FirstSuitableCandidateOrDefault(context, core, selectedThread, nextThread, null, bestCandidate.DynamicPriority, true)
++                    : FirstSuitableCandidateOrDefault(context, core, selectedThread, nextThread, LowerPriority(bestCandidate));
+ 
+                 if (dst != null)
+                 {
+diff --git a/src/Ryujinx.HLE/PerformanceStatistics.cs b/src/Ryujinx.HLE/PerformanceStatistics.cs
+index ea5a30f..41944b5 100644
+--- a/src/Ryujinx.HLE/PerformanceStatistics.cs
++++ b/src/Ryujinx.HLE/PerformanceStatistics.cs
+@@ -100,6 +100,7 @@ namespace Ryujinx.HLE
+ 
+         public void RecordGameFrameTime()
+         {
++            A19Probe.GuestPresented();
+             RecordFrameTime(FrameTypeGame);
+         }
+ 
+diff --git a/src/Ryujinx.Library/Library.cs b/src/Ryujinx.Library/Library.cs
+index a22b081..7472e7d 100644
+--- a/src/Ryujinx.Library/Library.cs
++++ b/src/Ryujinx.Library/Library.cs
+@@ -80,6 +80,25 @@ namespace Ryujinx.Library
+         [UnmanagedCallersOnly(EntryPoint = "a19_probe_experiments")]
+         public static void A19ProbeExperiments(int mask) => global::Ryujinx.Common.A19Probe.SetExperiments(mask);
+ 
++        [UnmanagedCallersOnly(EntryPoint = "a19_probe_apply_trial")]
++        public static int A19ProbeApplyTrial(int arg, int limit, int workers, int padCalls, int mask) =>
++            global::Ryujinx.Common.A19Probe.ApplyTrial(arg, limit, workers, padCalls, mask) ? 1 : 0;
++
++        [UnmanagedCallersOnly(EntryPoint = "a19_probe_read_trial")]
++        public static unsafe int A19ProbeReadTrial(int* output, int count)
++        {
++            if (output == null || count < 5) return 0;
++            output[0] = global::Ryujinx.Common.A19Probe.ArgumentBuffers;
++            output[1] = global::Ryujinx.Common.A19Probe.CommandLimit;
++            output[2] = global::Ryujinx.Common.A19Probe.ShaderWorkers;
++            output[3] = global::Ryujinx.Common.A19Probe.JitPadCalls;
++            output[4] = global::Ryujinx.Common.A19Probe.ExperimentMask;
++            return 5;
++        }
++
++        [UnmanagedCallersOnly(EntryPoint = "a19_trial_thermal")]
++        public static void A19TrialThermal(int state) => global::Ryujinx.Common.A19Trial.SetThermal(state);
++
+         [UnmanagedCallersOnly(EntryPoint = "a19_probe_frequency")]
+         public static long A19ProbeFrequency() => System.Diagnostics.Stopwatch.Frequency;
+ 
+@@ -87,6 +106,7 @@ namespace Ryujinx.Library
+         public static unsafe int A19ProbeRead(long* output, int count)
+         {
+             if (output == null || count < global::Ryujinx.Common.A19Probe.Count) return 0;
++            global::Ryujinx.Common.A19Probe.SnapshotRuntime();
+             for (int i = 0; i < global::Ryujinx.Common.A19Probe.Count; i++) output[i] = global::Ryujinx.Common.A19Probe.Read(i);
+             return global::Ryujinx.Common.A19Probe.Count;
+         }
+diff --git a/src/Ryujinx.Library/Window/WindowBase.cs b/src/Ryujinx.Library/Window/WindowBase.cs
+index 21204b4..933eef6 100644
+--- a/src/Ryujinx.Library/Window/WindowBase.cs
++++ b/src/Ryujinx.Library/Window/WindowBase.cs
+@@ -229,10 +229,14 @@ namespace Ryujinx.Library
+                         Device.Statistics.RecordFifoEnd();
+                     }
+ 
+-                    long presentStart = A19Probe.Start();
+-                    if (Device.PresentLoop(SwapBuffers))
++                    long presentStart = A19Probe.Begin(153);
++                    bool presented;
++                    try { presented = Device.PresentLoop(SwapBuffers); }
++                    finally { A19Probe.Finish(presentStart, 153, 154); }
++                    if (presented)
+                     {
+                         A19Probe.End(presentStart, 38, 39);
++                        A19Probe.HostPresented();
+                         if (!_ranFirstFrame)
+                         { 
+                             _ranFirstFrame = true;

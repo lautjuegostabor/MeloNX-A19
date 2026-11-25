@@ -1,0 +1,615 @@
+diff --git a/src/MeloNX/MeloNX/Common/A19Bench.c b/src/MeloNX/MeloNX/Common/A19Bench.c
+index 5487ef0..95f89b3 100644
+--- a/src/MeloNX/MeloNX/Common/A19Bench.c
++++ b/src/MeloNX/MeloNX/Common/A19Bench.c
+@@ -75,3 +75,75 @@ uint64_t a19_available_memory(void) {
+     return 0;
+ #endif
+ }
++
++// Independent crash-resilient trace. All counters are cumulative except the documented gauges.
++#include <stdio.h>
++#include <pthread.h>
++#include <unistd.h>
++#include <inttypes.h>
++#ifdef __APPLE__
++#include <mach/mach.h>
++#endif
++extern int32_t a19_probe_read(int64_t *, int32_t);
++extern int64_t a19_probe_frequency(void);
++static pthread_t trace_thread;
++static int trace_joinable; // start/stop called only from Swift main actor
++static _Atomic int trace_running, trace_count, trace_error;
++static FILE *trace_file;
++static uint64_t trace_footprint(void) {
++#ifdef __APPLE__
++    task_vm_info_data_t info;
++    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
++    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
++        return info.phys_footprint;
++#endif
++    return 0;
++}
++static int trace_flush(FILE *f) { return fflush(f) == 0 && fsync(fileno(f)) == 0; }
++static void *trace_worker(void *unused) {
++    (void)unused;
++    FILE *f = trace_file;
++    const double start = ns();
++    double previous = start, previousWrite = 0;
++    int sequence = 0;
++    while (atomic_load(&trace_running) && sequence <= 600) {
++        int64_t values[61];
++        double now = ns();
++        if (a19_probe_read(values, 61) != 61) { atomic_store(&trace_error, 2); break; }
++        int64_t cpu = a19_cpu_time_us();
++        uint64_t footprint = trace_footprint(), available = a19_available_memory();
++        fprintf(f, "{\"type\":\"sample\",\"seq\":%d,\"elapsedSeconds\":%.6f,\"intervalSeconds\":%.6f,\"processCPUTimeUs\":%" PRId64 ",\"footprintBytes\":%" PRIu64 ",\"availableProcessBytes\":%" PRIu64 ",\"previousWriteMs\":%.3f,\"counters\":[", sequence, (now-start)/1e9, (now-previous)/1e9, cpu, footprint, available, previousWrite);
++        for (int i = 0; i < 61; i++) fprintf(f, "%s%" PRId64, i ? "," : "", values[i]);
++        fputs("]}\n", f);
++        if (ferror(f) || !trace_flush(f)) { atomic_store(&trace_error, 3); break; }
++        previousWrite = (ns()-now)/1e6;
++        previous = now;
++        atomic_store(&trace_count, ++sequence);
++        // Poll stop every 100ms; normal sample cadence approximately one second.
++        for (int i=0; i<10 && atomic_load(&trace_running); i++) {
++            struct timespec delay = {0, 100000000}; nanosleep(&delay, NULL);
++        }
++    }
++    fclose(f);
++    atomic_store(&trace_running, 0);
++    return NULL;
++}
++void a19_trace_stop(void) {
++    atomic_store(&trace_running, 0);
++    if (trace_joinable) { pthread_join(trace_thread, NULL); trace_joinable = 0; }
++}
++int32_t a19_trace_start(const char *path) {
++    a19_trace_stop();
++    atomic_store(&trace_count, 0); atomic_store(&trace_error, 0);
++    trace_file = fopen(path, "w");
++    if (!trace_file) return 0;
++    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":2,\"build\":\"A19 Lab 0.5\",\"stopwatchFrequency\":%" PRId64 ",\"counterMode\":\"cumulative except gauges 29-35 and 44-60\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\"]}\n", a19_probe_frequency());
++    if (!trace_flush(trace_file)) { fclose(trace_file); return 0; }
++    atomic_store(&trace_running, 1);
++    if (pthread_create(&trace_thread, NULL, trace_worker, NULL) != 0) {
++        atomic_store(&trace_running, 0); fclose(trace_file); return 0;
++    }
++    trace_joinable = 1; return 1;
++}
++int32_t a19_trace_count(void) { return atomic_load(&trace_count); }
++int32_t a19_trace_error(void) { return atomic_load(&trace_error); }
+diff --git a/src/MeloNX/MeloNX/Common/A19Lab.swift b/src/MeloNX/MeloNX/Common/A19Lab.swift
+index d4e7b05..f1d988c 100644
+--- a/src/MeloNX/MeloNX/Common/A19Lab.swift
++++ b/src/MeloNX/MeloNX/Common/A19Lab.swift
+@@ -12,14 +12,19 @@ import Darwin
+ @_silgen_name("a19_cpu_benchmark") private nonisolated func a19CpuBench(_ output: UnsafeMutablePointer<Double>, _ count: Int32) -> Int32
+ @_silgen_name("a19_cpu_time_us") private func a19CpuTime() -> Int64
+ @_silgen_name("a19_available_memory") private func a19AvailableMemory() -> UInt64
++@_silgen_name("a19_trace_start") private func a19TraceStart(_ path: UnsafePointer<CChar>) -> Int32
++@_silgen_name("a19_trace_stop") private func a19TraceStop()
++@_silgen_name("a19_trace_count") private func a19TraceCount() -> Int32
++@_silgen_name("a19_trace_error") private func a19TraceError() -> Int32
+ 
+ private let a19Names: [String] = [
+     "frames", "frame_interval_us", "frame_le_8_334ms", "frame_8_334_to_16_667ms", "frame_16_667_to_33_334ms", "frame_33_334_to_50ms", "frame_50_to_100ms", "frame_gt_100ms",
+     "jit_compiles", "jit_compile_ticks", "jit_host_code_bytes", "jit_guest_code_bytes", "jit_shared_copy_bytes", "jit_local_copy_bytes", "jit_local_page_bytes", "jit_pad_calls", "jit_pad_ticks", "jit_local_icache_calls", "jit_local_icache_ticks",
+     "fence_wait_calls", "fence_wait_ticks", "queue_submit_calls", "queue_submit_ticks", "pipeline_create_calls", "pipeline_create_ticks", "mapped_upload_bytes", "mirror_upload_bytes", "background_compile_jobs", "background_compile_ticks",
+-    "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes"
++    "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes",
++    "mvk_statistics_result", "mvk_spirv_to_msl_count", "mvk_spirv_to_msl_avg_us", "mvk_msl_compile_count", "mvk_msl_compile_avg_us", "mvk_shader_cache_count", "mvk_shader_cache_avg_us", "mvk_pipeline_compile_count", "mvk_pipeline_compile_avg_us", "mvk_retrieve_command_count", "mvk_retrieve_command_avg_us", "mvk_encode_command_count", "mvk_encode_command_avg_us", "mvk_execute_command_count", "mvk_execute_command_avg_us", "mvk_gpu_memory_count", "mvk_gpu_memory_avg_kib_x1000"
+ ]
+-private let a19Gauges = Set(29...35)
++private let a19Gauges = Set(29...35).union(44...60)
+ 
+ private struct A19Sample: Codable {
+     let elapsedSeconds: Double
+@@ -106,6 +111,7 @@ private nonisolated enum A19Hardware {
+     @Published private(set) var benchmarking = false
+     @Published private(set) var sampleCount = 0
+     @Published private(set) var reportURL: URL?
++    @Published private(set) var traceURL: URL?
+     @Published private(set) var status = "Ready"
+     @Published var argumentBuffers = 0
+     @Published var commandLimit = 0
+@@ -121,7 +127,7 @@ private nonisolated enum A19Hardware {
+     private var gameStartSeconds: Double?
+     private var gameEndSeconds: Double?
+     private var gameExitCode: Int?
+-    private var previous = [Int64](repeating: 0, count: 44)
++    private var previous = [Int64](repeating: 0, count: 61)
+     private var started = 0.0
+     private var lastTime = 0.0
+     private var lastCpu: Int64 = -1
+@@ -129,8 +135,12 @@ private nonisolated enum A19Hardware {
+     private var destination: URL {
+         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(reportName)
+     }
++    private var traceDestination: URL {
++        destination.deletingLastPathComponent().appendingPathComponent("MeloNX-A19-trace.jsonl")
++    }
+     init() {
+         if FileManager.default.fileExists(atPath: destination.path) { reportURL = destination }
++        if FileManager.default.fileExists(atPath: traceDestination.path) { traceURL = traceDestination }
+     }
+     func apply() {
+         guard !running && !benchmarking else { return }
+@@ -149,7 +159,7 @@ private nonisolated enum A19Hardware {
+             result["metalMaxBufferLength"] = String(device.maxBufferLength)
+             result["metalCounterSets"] = device.counterSets?.map(\.name).joined(separator: ",") ?? "unavailable"
+         }
+-        for key in ["hw.cachelinesize", "hw.l1icachesize", "hw.l1dcachesize", "hw.l2cachesize", "hw.l3cachesize", "hw.optional.arm.FEAT_LSE", "hw.optional.arm.FEAT_LRCPC", "hw.optional.arm.FEAT_FP16", "hw.optional.arm.FEAT_DotProd", "hw.optional.arm.FEAT_MOPS"] {
++        for key in ["hw.nperflevels", "hw.perflevel0.physicalcpu", "hw.perflevel1.physicalcpu", "hw.perflevel0.l1dcachesize", "hw.perflevel1.l1dcachesize", "hw.perflevel0.l1icachesize", "hw.perflevel1.l1icachesize", "hw.perflevel0.l2cachesize", "hw.perflevel1.l2cachesize", "hw.cachelinesize", "hw.l1icachesize", "hw.l1dcachesize", "hw.l2cachesize", "hw.l3cachesize", "hw.optional.arm.FEAT_LSE", "hw.optional.arm.FEAT_LRCPC", "hw.optional.arm.FEAT_FP16", "hw.optional.arm.FEAT_DotProd", "hw.optional.arm.FEAT_MOPS"] {
+             var value: UInt64 = 0; var size = MemoryLayout<UInt64>.size
+             let code = key.withCString { sysctlbyname($0, &value, &size, nil, 0) }
+             if code == 0 { result[key] = String(value) }
+@@ -174,7 +184,7 @@ private nonisolated enum A19Hardware {
+         }
+     }
+     private func read() -> [Int64]? {
+-        var result = [Int64](repeating: 0, count: 44)
++        var result = [Int64](repeating: 0, count: 61)
+         let count = result.withUnsafeMutableBufferPointer { a19Read($0.baseAddress!, Int32($0.count)) }
+         return count == Int32(result.count) ? result : nil
+     }
+@@ -205,14 +215,19 @@ private nonisolated enum A19Hardware {
+         gameSettings = [:]; gameStartSeconds = nil; gameEndSeconds = nil; gameExitCode = nil
+         selected = ["argumentBuffers":argumentBuffers,"commandLimit":commandLimit,"shaderWorkers":shaderWorkers,"jitPadCalls":jitPadCalls]
+         started = ProcessInfo.processInfo.systemUptime; lastTime = started; lastCpu = a19CpuTime()
+-        running = true; a19Enable(1); status = "Capture active. Start a controlled test."
++        a19Enable(1)
++        guard traceDestination.path.withCString({ a19TraceStart($0) }) == 1 else {
++            a19Enable(0); status = "Native trace could not start."; return
++        }
++        traceURL = traceDestination
++        running = true; status = "Native capture active. Start a controlled test."
+         writeReport()
+         task = Task { [weak self] in
+             while !Task.isCancelled {
+                 try? await Task.sleep(nanoseconds: 1_000_000_000)
+                 guard !Task.isCancelled, let self, self.running else { break }
+-                self.sample()
+-                if self.samples.count >= 600 { self.stop(); break }
++                self.sampleCount = Int(a19TraceCount())
++                if a19TraceError() != 0 || self.sampleCount >= 601 { self.stop(); break }
+             }
+         }
+     }
+@@ -227,11 +242,13 @@ private nonisolated enum A19Hardware {
+     }
+     func stop() {
+         guard running else { return }
+-        if samples.count < 600 { sample() }; running = false; a19Enable(0); task?.cancel(); task = nil
+-        status = "Capture stopped: \(sampleCount) samples."; writeReport()
++        a19TraceStop(); sampleCount = Int(a19TraceCount())
++        running = false; a19Enable(0); task?.cancel(); task = nil
++        status = a19TraceError() == 0 ? "Capture stopped: \(sampleCount) samples." : "Capture stopped with write/read error: \(a19TraceError())."
++        writeReport()
+     }
+     private func writeReport() {
+-        let report = A19Report(schemaVersion: 1, build: "A19 Lab 0.4", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Counters are interval deltas except MVK and shader worker gauges. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
++        let report = A19Report(schemaVersion: 2, build: "A19 Lab 0.5", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, samples: samples, note: "Native JSONL counters are cumulative except gauges at indices 29–35 and 44–60; export both files. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, games, pairing or file paths included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
+         do { let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]; try encoder.encode(report).write(to: destination, options: .atomic); reportURL = destination }
+         catch { status = "Report could not be saved." }
+     }
+@@ -255,13 +272,16 @@ struct A19LabView: View {
+             Section("Core trace") {
+                 if lab.running { Button("Stop and save trace") { lab.stop() } }
+                 else { Button("Start trace") { lab.start() }.disabled(lab.benchmarking) }
+-                Text("Samples: \(lab.sampleCount) / 600. Saves every 10 samples to the app’s Files folder.").font(.caption)
++                Text("Samples: \(lab.sampleCount) / 601. Native JSONL saved from the first sample, even if the interface stalls.").font(.caption)
+             }
+             Section("Export") {
+                 if let url = lab.reportURL {
+                     if #available(iOS 16.0, *) { ShareLink(item: url) { Label("Share research JSON", systemImage: "square.and.arrow.up") } }
+                     else { Text("Report saved in Files: \(url.lastPathComponent)") }
+                 }
++                if let trace = lab.traceURL {
++                    if #available(iOS 16.0, *) { ShareLink(item: trace) { Label("Share native trace JSONL", systemImage: "square.and.arrow.up") } }
++                }
+                 Text(lab.status).font(.caption)
+             }
+         }.navigationTitle("A19 Performance Lab")
+diff --git a/src/Ryujinx.Common/A19Probe.cs b/src/Ryujinx.Common/A19Probe.cs
+index 7176172..1446206 100644
+--- a/src/Ryujinx.Common/A19Probe.cs
++++ b/src/Ryujinx.Common/A19Probe.cs
+@@ -7,8 +7,10 @@ namespace Ryujinx.Common
+     // Cumulative counters; snapshots are deliberately non-blocking and approximate across threads.
+     public static class A19Probe
+     {
+-        public const int Count = 44;
+-        private static readonly long[] Values = new long[Count];
++        public const int Count = 61;
++        // A19 reports 128-byte cache lines. 256-byte stride also prevents adjacent counters sharing a line.
++        private const int Stride = 32;
++        private static readonly long[] Values = new long[Count * Stride];
+         private static int _enabled, _argumentBuffers, _commandLimit, _shaderWorkers, _jitPadCalls;
+         public static bool Enabled => Volatile.Read(ref _enabled) != 0;
+         public static int ArgumentBuffers => Volatile.Read(ref _argumentBuffers);
+@@ -26,24 +28,24 @@ namespace Ryujinx.Common
+         public static long Start() => Enabled ? Stopwatch.GetTimestamp() : 0;
+         public static void Add(int index, long amount = 1)
+         {
+-            if (Enabled) Interlocked.Add(ref Values[index], amount);
++            if (Enabled) Interlocked.Add(ref Values[index * Stride], amount);
+         }
+-        public static void Set(int index, long value) => Interlocked.Exchange(ref Values[index], value);
++        public static void Set(int index, long value) => Interlocked.Exchange(ref Values[index * Stride], value);
+         public static void End(long start, int count, int ticks)
+         {
+             if (start == 0 || !Enabled) return;
+-            Interlocked.Increment(ref Values[count]);
+-            Interlocked.Add(ref Values[ticks], Stopwatch.GetTimestamp() - start);
++            Interlocked.Increment(ref Values[count * Stride]);
++            Interlocked.Add(ref Values[ticks * Stride], Stopwatch.GetTimestamp() - start);
+         }
+         public static void Frame(double seconds)
+         {
+-            if (!Enabled || seconds <= 0 || seconds > 10) return;
++            if (!Enabled || !double.IsFinite(seconds) || seconds <= 0 || seconds > 86400) return;
+             long us = (long)(seconds * 1_000_000);
+-            Interlocked.Increment(ref Values[0]);
+-            Interlocked.Add(ref Values[1], us);
++            Interlocked.Increment(ref Values[0 * Stride]);
++            Interlocked.Add(ref Values[1 * Stride], us);
+             int bucket = us <= 8334 ? 2 : us <= 16667 ? 3 : us <= 33334 ? 4 : us <= 50000 ? 5 : us <= 100000 ? 6 : 7;
+-            Interlocked.Increment(ref Values[bucket]);
++            Interlocked.Increment(ref Values[bucket * Stride]);
+         }
+-        public static long Read(int index) => Interlocked.Read(ref Values[index]);
++        public static long Read(int index) => Interlocked.Read(ref Values[index * Stride]);
+     }
+ }
+diff --git a/src/Ryujinx.Cpu/LightningJit/Cache/DualMappedNoWxCache.cs b/src/Ryujinx.Cpu/LightningJit/Cache/DualMappedNoWxCache.cs
+index c3a7337..e886dbd 100644
+--- a/src/Ryujinx.Cpu/LightningJit/Cache/DualMappedNoWxCache.cs
++++ b/src/Ryujinx.Cpu/LightningJit/Cache/DualMappedNoWxCache.cs
+@@ -345,12 +345,15 @@ namespace Ryujinx.Cpu.LightningJit.Cache
+ 
+             int pageSize = (int)MemoryBlock.GetPageSize();
+ 
+-            foreach ((_, ThreadLocalCacheEntry entry) in threadLocalCache)
++            lock (_lock)
+             {
+-                int sizeAligned = BitUtils.AlignUp(entry.Size, pageSize);
++                foreach ((_, ThreadLocalCacheEntry entry) in threadLocalCache)
++                {
++                    int sizeAligned = BitUtils.AlignUp(entry.Size, pageSize);
+ 
+-                _localCache.Free(entry.Offset, sizeAligned);
+-                // _localCache.ReprotectAsRw(entry.Offset, sizeAligned);
++                    _localCache.Free(entry.Offset, sizeAligned);
++                    // _localCache.ReprotectAsRw(entry.Offset, sizeAligned);
++                }
+             }
+ 
+             threadLocalCache.Clear();
+diff --git a/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs b/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs
+index 06575e2..26a9bc8 100644
+--- a/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs
++++ b/src/Ryujinx.Graphics.Vulkan/MemoryAllocator.cs
+@@ -70,6 +70,12 @@ namespace Ryujinx.Graphics.Vulkan
+ 
+             try
+             {
++                // Another allocator may have inserted this type after our read lock was released.
++                foreach (MemoryAllocatorBlockList existing in _blockLists)
++                {
++                    if (existing.MemoryTypeIndex == memoryTypeIndex && existing.ForBuffer == isBuffer)
++                        return existing.Allocate(size, alignment, map);
++                }
+                 MemoryAllocatorBlockList newBl = new(_api, _device, memoryTypeIndex, _blockAlignment, isBuffer);
+                 _blockLists.Add(newBl);
+ 
+diff --git a/src/Ryujinx.Graphics.Vulkan/MemoryAllocatorBlockList.cs b/src/Ryujinx.Graphics.Vulkan/MemoryAllocatorBlockList.cs
+index acd7915..79899f5 100644
+--- a/src/Ryujinx.Graphics.Vulkan/MemoryAllocatorBlockList.cs
++++ b/src/Ryujinx.Graphics.Vulkan/MemoryAllocatorBlockList.cs
+@@ -188,7 +188,7 @@ namespace Ryujinx.Graphics.Vulkan
+                 throw new ArgumentOutOfRangeException(nameof(alignment), $"Invalid alignment 0x{alignment:X}.");
+             }
+ 
+-            _lock.EnterReadLock();
++            _lock.EnterWriteLock();
+ 
+             try
+             {
+@@ -208,7 +208,7 @@ namespace Ryujinx.Graphics.Vulkan
+             }
+             finally
+             {
+-                _lock.ExitReadLock();
++                _lock.ExitWriteLock();
+             }
+ 
+             ulong blockAlignedSize = BitUtils.AlignUp(size, (ulong)_blockAlignment);
+@@ -227,16 +227,20 @@ namespace Ryujinx.Graphics.Vulkan
+             if (map)
+             {
+                 void* pointer = null;
+-                _api.MapMemory(_device, deviceMemory, 0, blockAlignedSize, 0, ref pointer).ThrowOnError();
++                Result mapResult = _api.MapMemory(_device, deviceMemory, 0, blockAlignedSize, 0, ref pointer);
++                if (mapResult != Result.Success)
++                {
++                    _api.FreeMemory(_device, deviceMemory, null);
++                    mapResult.ThrowOnError();
++                }
+                 hostPointer = (nint)pointer;
+             }
+ 
+             Block newBlock = new(deviceMemory, hostPointer, blockAlignedSize);
+ 
+-            InsertBlock(newBlock);
+-
+             ulong newBlockOffset = newBlock.Allocate(size, alignment);
+             Debug.Assert(newBlockOffset != InvalidOffset);
++            InsertBlock(newBlock);
+ 
+             return new MemoryAllocation(this, newBlock, deviceMemory, GetHostPointer(newBlock, newBlockOffset), newBlockOffset, size);
+         }
+@@ -253,30 +257,22 @@ namespace Ryujinx.Graphics.Vulkan
+ 
+         public void Free(Block block, ulong offset, ulong size)
+         {
+-            block.Free(offset, size);
+-
+-            if (block.IsTotallyFree())
++            bool destroy = false;
++            _lock.EnterWriteLock();
++            try
+             {
+-                _lock.EnterWriteLock();
+-
+-                try
++                block.Free(offset, size);
++                if (block.IsTotallyFree())
+                 {
+-                    for (int i = 0; i < _blocks.Count; i++)
+-                    {
+-                        if (_blocks[i] == block)
+-                        {
+-                            _blocks.RemoveAt(i);
+-                            break;
+-                        }
+-                    }
+-                }
+-                finally
+-                {
+-                    _lock.ExitWriteLock();
++                    destroy = _blocks.Remove(block);
+                 }
+-
+-                block.Destroy(_api, _device);
+             }
++            finally
++            {
++                _lock.ExitWriteLock();
++            }
++            // The block is unreachable by Allocate before freeing the Vulkan resource.
++            if (destroy) block.Destroy(_api, _device);
+         }
+ 
+         private void InsertBlock(Block block)
+diff --git a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKConfiguration.cs b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKConfiguration.cs
+index 2719993..579a9b7 100644
+--- a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKConfiguration.cs
++++ b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKConfiguration.cs
+@@ -69,7 +69,7 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+         public Bool32 DebugMode;
+         public Bool32 ShaderConversionFlipVertexY;
+         public Bool32 SynchronousQueueSubmits;
+-        public Bool32 PrefillMetalCommandBuffers;
++        public uint PrefillMetalCommandBuffers;
+         public uint MaxActiveMetalCommandBuffersPerQueue;
+         public Bool32 SupportLargeQueryPools;
+         public Bool32 PresentWithCommandBuffer;
+@@ -83,7 +83,7 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+         public Bool32 FullImageViewSwizzle;
+         public uint DefaultGPUCaptureScopeQueueFamilyIndex;
+         public uint DefaultGPUCaptureScopeQueueIndex;
+-        public Bool32 FastMathEnabled;
++        public uint FastMathEnabled;
+         public MVKConfigLogLevel LogLevel;
+         public MVKConfigTraceVulkanCalls TraceVulkanCalls;
+         public Bool32 ForceLowPowerGPU;
+@@ -94,11 +94,11 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+         public Bool32 Texture1DAs2D;
+         public Bool32 PreallocateDescriptors;
+         public Bool32 UseCommandPooling;
+-        public Bool32 UseMTLHeap;
+-        public Bool32 LogActivityPerformanceInline;
++        public uint UseMTLHeap;
++        public uint LogActivityPerformanceInline;
+         public uint ApiVersionToAdvertise;
+         public MVKConfigAdvertiseExtensions AdvertiseExtensions;
+         public Bool32 ResumeLostDevice;
+-        public Bool32 UseMetalArgumentBuffers;
++        public uint UseMetalArgumentBuffers;
+     }
+ }
+diff --git a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
+index af95d1c..bf7c08b 100644
+--- a/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
++++ b/src/Ryujinx.Graphics.Vulkan/MoltenVK/MVKInitialization.cs
+@@ -21,23 +21,35 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+ 
+         public static void Initialize()
+         {
++            A19Probe.Set(44, -104); // no native statistics sampled for this device yet
++            for (int i = 45; i < A19Probe.Count; i++) A19Probe.Set(i, 0);
+             nint configSize = (nint)Marshal.SizeOf<MVKConfiguration>();
+ 
+             Result getResult = vkGetMoltenVKConfigurationMVK(nint.Zero, out MVKConfiguration config, ref configSize);
+             A19Probe.Set(29, (int)getResult);
+ 
+-            config.UseMetalArgumentBuffers = true;
+-            config.FastMathEnabled = true;
++            int knownSize = Marshal.SizeOf<MVKConfiguration>();
++            // MoltenVK returns Incomplete when the caller supplies an older prefix.
++            // Never send a zero/default struct if the read failed or the prefix is too short.
++            if (!Readable(getResult, configSize, knownSize)) return;
++            config.UseMetalArgumentBuffers = 1;
++            config.FastMathEnabled = 1;
+ 
+             config.SemaphoreSupportStyle = MVKVkSemaphoreSupportStyle.MVK_CONFIG_VK_SEMAPHORE_SUPPORT_STYLE_SINGLE_QUEUE;
+             // config.SynchronousQueueSubmits = false;
+ 
+             config.ResumeLostDevice = true;
+ 
+-            if (OperatingSystem.IsIOS() && getResult == Result.Success)
++            if (OperatingSystem.IsIOS())
+             {
+-                if (A19Probe.ArgumentBuffers != 0) config.UseMetalArgumentBuffers = A19Probe.ArgumentBuffers == 1;
++                if (A19Probe.ArgumentBuffers != 0) config.UseMetalArgumentBuffers = A19Probe.ArgumentBuffers == 1 ? 1u : 0u;
+                 if (A19Probe.CommandLimit != 0) config.MaxActiveMetalCommandBuffersPerQueue = (uint)A19Probe.CommandLimit;
++                if (A19Probe.Enabled)
++                {
++                    config.PerformanceTracking = true;
++                    config.PerformanceLoggingFrameCount = 0;
++                    config.LogActivityPerformanceInline = 0;
++                }
+             }
+             configSize = (nint)Marshal.SizeOf<MVKConfiguration>();
+             Result setResult = vkSetMoltenVKConfigurationMVK(nint.Zero, config, ref configSize);
+@@ -45,11 +57,69 @@ namespace Ryujinx.Graphics.Vulkan.MoltenVK
+             configSize = (nint)Marshal.SizeOf<MVKConfiguration>();
+             Result readResult = vkGetMoltenVKConfigurationMVK(nint.Zero, out MVKConfiguration actual, ref configSize);
+             A19Probe.Set(31, (int)readResult);
+-            A19Probe.Set(32, readResult == Result.Success ? (actual.UseMetalArgumentBuffers ? 1 : 0) : -1);
+-            A19Probe.Set(33, readResult == Result.Success ? actual.MaxActiveMetalCommandBuffersPerQueue : -1L);
++            A19Probe.Set(32, Readable(readResult, configSize, knownSize) ? (long)actual.UseMetalArgumentBuffers : -1L);
++            A19Probe.Set(33, Readable(readResult, configSize, knownSize) ? actual.MaxActiveMetalCommandBuffersPerQueue : -1L);
+             A19Probe.Set(34, configSize.ToInt64());
+         }
+ 
++        // v1.4.0 has 24 consecutive trackers, each 48 bytes on arm64.
++        // Reject different private API layouts rather than interpreting an incompatible buffer.
++        [StructLayout(LayoutKind.Sequential)]
++        private struct Tracker
++        {
++            public uint Count;
++            public double Latest, Previous, Average, Minimum, Maximum;
++        }
++
++        [LibraryImport("libMoltenVK.dylib")]
++        private static unsafe partial Result vkGetPerformanceStatisticsMVK(nint device, Tracker* statistics, ref nint size);
++
++        private static bool _statsUnavailable;
++
++        public static unsafe void SamplePerformance(Device device)
++        {
++            if (!OperatingSystem.IsIOS() || !A19Probe.Enabled || _statsUnavailable) return;
++            const int trackerCount = 24;
++            nint expected = trackerCount * sizeof(Tracker);
++            if (sizeof(Tracker) != 48) { A19Probe.Set(44, -100); _statsUnavailable = true; return; }
++            try
++            {
++                nint size = 0;
++                Result query = vkGetPerformanceStatisticsMVK(device.Handle, null, ref size);
++                if (size != expected || (query != Result.Success && query != Result.Incomplete))
++                {
++                    A19Probe.Set(44, -101); _statsUnavailable = true; return;
++                }
++                Tracker* stats = stackalloc Tracker[trackerCount];
++                Result result = vkGetPerformanceStatisticsMVK(device.Handle, stats, ref size);
++                A19Probe.Set(44, (int)result);
++                if (result != Result.Success || size != expected) return;
++                // Counts and averages are device-lifetime gauges, not interval deltas.
++                ReadTracker(stats[1], 45);  // SPIR-V to MSL
++                ReadTracker(stats[2], 47);  // MSL compilation
++                ReadTracker(stats[6], 49);  // shader library cache
++                ReadTracker(stats[9], 51);  // pipeline compilation
++                ReadTracker(stats[14], 53); // retrieve command buffer
++                ReadTracker(stats[15], 55); // command buffer encoding
++                ReadTracker(stats[18], 57); // commit to completion
++                ReadTracker(stats[23], 59); // GPU allocated memory (KiB)
++            }
++            catch (EntryPointNotFoundException) { A19Probe.Set(44, -102); _statsUnavailable = true; }
++            catch (DllNotFoundException) { A19Probe.Set(44, -103); _statsUnavailable = true; }
++        }
++
++        private static void ReadTracker(Tracker tracker, int index)
++        {
++            A19Probe.Set(index, tracker.Count);
++            double scaled = tracker.Average * 1000.0;
++            A19Probe.Set(index + 1, double.IsFinite(scaled) && scaled >= 0 && scaled < long.MaxValue ? (long)scaled : -1);
++        }
++
++        private static bool Readable(Result result, nint size, int expected)
++        {
++            return (result == Result.Success || result == Result.Incomplete) && size.ToInt64() >= expected;
++        }
++
+         private static string[] Resolver(string path)
+         {
+             if (path.EndsWith(VulkanLib))
+diff --git a/src/Ryujinx.Graphics.Vulkan/VulkanRenderer.cs b/src/Ryujinx.Graphics.Vulkan/VulkanRenderer.cs
+index 5016410..2a0cbc9 100644
+--- a/src/Ryujinx.Graphics.Vulkan/VulkanRenderer.cs
++++ b/src/Ryujinx.Graphics.Vulkan/VulkanRenderer.cs
+@@ -1,4 +1,5 @@
+ using Gommon;
++using Ryujinx.Common;
+ using Ryujinx.Common.Configuration;
+ using Ryujinx.Common.Helper;
+ using Ryujinx.Common.Logging;
+@@ -987,9 +988,20 @@ namespace Ryujinx.Graphics.Vulkan
+             return false;
+         }
+ 
++        private long _lastA19Statistics;
++
+         public void PreFrame()
+         {
+             SyncManager.Cleanup();
++            if (OperatingSystem.IsIOS() && A19Probe.Enabled)
++            {
++                long now = System.Diagnostics.Stopwatch.GetTimestamp();
++                if (now - _lastA19Statistics >= System.Diagnostics.Stopwatch.Frequency)
++                {
++                    _lastA19Statistics = now;
++                    MVKInitialization.SamplePerformance(_device);
++                }
++            }
+         }
+ 
+         public ICounterEvent ReportCounter(CounterType type, EventHandler<ulong> resultHandler, float divisor, bool hostReserved)
+diff --git a/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/IClient.cs b/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/IClient.cs
+index cb56be3..b941575 100644
+--- a/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/IClient.cs
++++ b/src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/IClient.cs
+@@ -9,6 +9,7 @@ using System.Net;
+ using System.Net.Sockets;
+ using System.Runtime.CompilerServices;
+ using System.Text;
++using System.Threading;
+ 
+ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd
+ {
+@@ -22,6 +23,7 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd
+             ManagedSocketPollManager.Instance
+         ];
+ 
++        private static long _badDescriptorCount;
+         private BsdContext _context;
+         private readonly bool _isPrivileged;
+ 
+@@ -36,7 +38,16 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd
+             {
+                 if (errorCode != LinuxError.EWOULDBLOCK)
+                 {
+-                    Logger.Warning?.Print(LogClass.ServiceBsd, $"Operation failed with error {errorCode}.");
++                    if (OperatingSystem.IsIOS() && errorCode == LinuxError.EBADF)
++                    {
++                        long count = Interlocked.Increment(ref _badDescriptorCount);
++                        if (count <= 8 || (count & 255) == 0)
++                            Logger.Warning?.Print(LogClass.ServiceBsd, $"Operation failed with error {errorCode} (occurrence {count}, repeated messages limited).");
++                    }
++                    else
++                    {
++                        Logger.Warning?.Print(LogClass.ServiceBsd, $"Operation failed with error {errorCode}.");
++                    }
+                 }
+ 
+                 result = -1;

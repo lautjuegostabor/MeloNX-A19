@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: [a19core-native-integration]
-    paths: ['A19Core-recovery-checkpoint.zip']
+    paths: ['A19Core-source-transfer.txt']
 permissions:
   contents: read
 concurrency:
@@ -18,7 +18,7 @@ jobs:
         with:
           path: project
           sparse-checkout: |
-            A19Core-recovery-checkpoint.zip
+            A19Core-source-transfer.txt
           sparse-checkout-cone-mode: false
       - uses: actions/checkout@v4
         with:
@@ -37,27 +37,42 @@ jobs:
           set -euo pipefail
           test "$(git -C upstream rev-parse HEAD)" = 39d35671a57ee30d5f528c13d206fd6309a84b8f
           python - <<'PY'
-          import hashlib, json, pathlib, zipfile
-          archive = pathlib.Path("project/A19Core-recovery-checkpoint.zip")
+          import base64, hashlib, json, pathlib, zlib
           root = pathlib.Path("upstream")
-          assert hashlib.file_digest(archive.open("rb"), "sha256").hexdigest() == "13ebf138e16c0136a6bd36345160b93bfe4e7d3b89a43535fee5641648517ae3", "Incorrect checkpoint"
-          with zipfile.ZipFile(archive) as z:
-              assert z.testzip() is None
-              manifest = json.loads(z.read("A19CORE-WORK-STATE.json"))
-              expected = manifest["modified"] | manifest["added"]
-              assert len(expected) == 58
-              assert len(z.namelist()) == 59 and set(z.namelist()) == set(expected) | {"A19CORE-WORK-STATE.json"}
-              for name, digest in expected.items():
-                  p = pathlib.PurePosixPath(name)
-                  assert not p.is_absolute() and ".." not in p.parts
-                  assert hashlib.sha256(z.read(name)).hexdigest() == digest, name
-              assert manifest["removed"] == ["runtime/src/imgpack.c"]
-              for name in manifest["removed"]:
-                  (root / name).unlink()
-              z.extractall(root)
-              for name, digest in expected.items():
-                  assert hashlib.sha256((root / name).read_bytes()).hexdigest() == digest
-          print("Restored all 59 checkpoint files; 58 per-file hashes verified.")
+          payload = "".join(pathlib.Path("project/A19Core-source-transfer.txt").read_text().split()).encode()
+          assert hashlib.sha256(payload).hexdigest() == "ab2f034033da7a3ac725bfedee4236c47418c5af238bc92f78ee2807840cbf82", "Incorrect transfer payload"
+          transfer = json.loads(zlib.decompress(base64.b64decode(payload, validate=True)))
+          manifest = json.loads(transfer["manifest"])
+          expected = manifest["modified"] | manifest["added"]
+          assert len(expected) == 58 and set(expected) == set(transfer["ops"])
+          def safe_path(name):
+              p = pathlib.PurePosixPath(name)
+              assert not p.is_absolute() and ".." not in p.parts
+              return root / p
+          # Read all originals before applying any edits.
+          reconstructed = {}
+          for name, (source, edits, digest) in transfer["ops"].items():
+              assert digest == expected[name]
+              if source:
+                  lines = safe_path(source).read_bytes().splitlines(True)
+                  for i, j, encoded in reversed(edits):
+                      lines[i:j] = [base64.b64decode(encoded, validate=True)]
+                  value = b"".join(lines)
+              else:
+                  value = base64.b64decode(edits, validate=True)
+              assert hashlib.sha256(value).hexdigest() == digest, name
+              reconstructed[name] = value
+          assert manifest["removed"] == ["runtime/src/imgpack.c"]
+          for name in manifest["removed"]:
+              safe_path(name).unlink()
+          for name, value in reconstructed.items():
+              p = safe_path(name)
+              p.parent.mkdir(parents=True, exist_ok=True)
+              p.write_bytes(value)
+          (root / "A19CORE-WORK-STATE.json").write_text(transfer["manifest"])
+          for name, digest in expected.items():
+              assert hashlib.sha256(safe_path(name).read_bytes()).hexdigest() == digest
+          print("Restored exact production checkpoint; 58 per-file hashes verified.")
           PY
       - name: Prepare Apple Silicon and pinned dependencies
         working-directory: upstream

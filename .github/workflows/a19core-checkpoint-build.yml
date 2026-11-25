@@ -104,7 +104,17 @@ jobs:
           for name,sha in expected.items():
               assert hashlib.sha256((root/name).read_bytes()).hexdigest()==sha,name
           (root/"A19CORE-IMPORT-AUDIT.json").write_text(json.dumps(expected,indent=2))
-          print("Verified all eight corrected source files.")
+          # CS0136: avoid shadowing the existing checkpoint rejection flag.
+          test=root/"a19-tests/converter-checkpoint.cs"
+          data=test.read_bytes()
+          old=b'bool rejected=false;try{A19Input.ValidateKeys(keys);}catch(InvalidDataException){rejected=true;}Check(rejected,"Invalid keys accepted");'
+          assert data.count(old)==1
+          data=data.replace(old,old.replace(b"rejected",b"keysRejected"))
+          assert hashlib.sha256(data).hexdigest()=="964e59ca1b9aca1fc9967b1ba83083af71995d519c32d7437e7082154b94ecc3"
+          test.write_bytes(data)
+          expected["a19-tests/converter-checkpoint.cs"]=hashlib.sha256(data).hexdigest()
+          (root/"A19CORE-IMPORT-AUDIT.json").write_text(json.dumps(expected,indent=2))
+          print("Verified all eight corrected source files, including test scope fix.")
           PY
       - name: Prepare Apple Silicon and pinned dependencies
         working-directory: upstream

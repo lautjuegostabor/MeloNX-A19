@@ -1,7 +1,7 @@
-name: Build A19Core Modular 1.2 (unsigned)
+name: Build A19Core Modular 1.3 (unsigned)
 on:
   push:
-    branches: [ a19core-modular-1.2 ]
+    branches: [ a19core-modular-1.3 ]
   workflow_dispatch:
 concurrency:
   group: a19-${{ github.ref }}
@@ -46,6 +46,10 @@ jobs:
           cp "../a19core/patches/a19core-modular.patch" "$RUNNER_TEMP/a19core-modular.patch"
           git apply --check "$RUNNER_TEMP/a19core-modular.patch"
           git apply "$RUNNER_TEMP/a19core-modular.patch"
+          cp "../a19core/patches/a19core-performance-1.3.patch" "$RUNNER_TEMP/a19core-performance-1.3.patch"
+          echo '775333b4c25d7219d4cb34262bd441cf8135d22c8961326b074c3e48f034bdb1  '"$RUNNER_TEMP/a19core-performance-1.3.patch" | shasum -a 256 -c -
+          git apply --check "$RUNNER_TEMP/a19core-performance-1.3.patch"
+          git apply "$RUNNER_TEMP/a19core-performance-1.3.patch"
           chmod +x distribution/ios/a19/*.sh distribution/ios/build.sh
       - uses: actions/setup-dotnet@v4
         with:
@@ -113,7 +117,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: source/src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
-          key: core-a19-modular-fd2e768de7e997d9544e1b20-${{ steps.preflight.outputs.fingerprint }}-f925129209afd55927a0201d82285b8fa4b7ba30-${{ hashFiles('source/distribution/ios/build.sh') }}
+          key: core-a19-modular-775333b4c25d7219d4cb3426-${{ steps.preflight.outputs.fingerprint }}-f925129209afd55927a0201d82285b8fa4b7ba30-${{ hashFiles('source/distribution/ios/build.sh') }}
       - name: Compile Ryujinx core if needed
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: distribution/ios/build.sh
@@ -142,6 +146,6 @@ jobs:
         run: distribution/ios/a19/package.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: A19Core-Modular-1.2-unsigned
+          name: A19Core-Modular-1.3-unsigned
           path: source/build/MeloNX-A19-unsigned.ipa
           if-no-files-found: error

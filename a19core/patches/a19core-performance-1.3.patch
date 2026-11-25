@@ -1,0 +1,323 @@
+diff --git a/src/MeloNX/MeloNX/Common/A19Bench.c b/src/MeloNX/MeloNX/Common/A19Bench.c
+--- a/src/MeloNX/MeloNX/Common/A19Bench.c
++++ b/src/MeloNX/MeloNX/Common/A19Bench.c
+@@ -116,15 +116,15 @@
+     int sequence = 0, lastPhase = -1;
+     while (sequence <= 2400) {
+         int final = !atomic_load(&trace_running);
+-        int64_t values[171]; int32_t trial[5] = {-1,-1,-1,-1,-1};
++        int64_t values[175]; int32_t trial[5] = {-1,-1,-1,-1,-1};
+         double now = ns();
+-        if (a19_probe_read(values, 171) != 171) { atomic_store(&trace_error, 2); break; }
++        if (a19_probe_read(values, 175) != 175) { atomic_store(&trace_error, 2); break; }
+         int trialCount = a19_probe_read_trial(trial, 5);
+         int64_t cpu = a19_cpu_time_us();
+         uint64_t footprint = trace_footprint(), available = a19_available_memory();
+         int phase = atomic_load(&trace_phase);
+         fprintf(f, "{\"type\":\"sample\",\"seq\":%d,\"elapsedSeconds\":%.6f,\"intervalSeconds\":%.6f,\"processCPUTimeUs\":%" PRId64 ",\"footprintBytes\":%" PRIu64 ",\"availableProcessBytes\":%" PRIu64 ",\"previousSampleCostMs\":%.3f,\"phase\":%d,\"exitCode\":%d,\"thermalState\":%d,\"trialReadbackCount\":%d,\"trial\":[%d,%d,%d,%d,%d],\"counters\":[", sequence, (now-start)/1e9, (now-previous)/1e9, cpu, footprint, available, previousWrite, phase, atomic_load(&trace_exit), atomic_load(&trace_thermal), trialCount, trial[0],trial[1],trial[2],trial[3],trial[4]);
+-        for (int i = 0; i < 171; i++) fprintf(f, "%s%" PRId64, i ? "," : "", values[i]);
++        for (int i = 0; i < 175; i++) fprintf(f, "%s%" PRId64, i ? "," : "", values[i]);
+         fputs("]}\n", f);
+         // Flush each line to the OS; fsync on phase changes, once per second, and final sample.
+         if (ferror(f) || fflush(f) != 0 || ((sequence % 4 == 0 || phase != lastPhase || final) && fsync(fileno(f)) != 0)) { atomic_store(&trace_error, 3); break; }
+@@ -152,7 +152,7 @@
+     atomic_store(&trace_phase, 0); atomic_store(&trace_exit, 0);
+     trace_file = fopen(path, "w");
+     if (!trace_file) return 0;
+-    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":5,\"build\":\"A19Core Modular 1.2\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\",\"jit_masked_index_fusions\",\"native_fp16_guest_ops\",\"tile_clear_passes\",\"retained_block_reuses\",\"retained_block_reuse_bytes\",\"qos_set_failures\",\"a19_buffer_lookup_hits\",\"a19_buffer_growth_rejected\",\"a19_uniform_reuses\",\"a19_shader_save_requeues\",\"a19_no_spin_renderer_instances\",\"a19_syncpoint_fast_hits\",\"a19_scheduler_rotations\",\"a19_temporary_pool_hits\",\"a19_texture_evictions\",\"a19_isolated_pipeline_calls\",\"a19_thermal_delays\",\"a19_gpfifo_replays\",\"frame_hist_le_4000_us\",\"frame_hist_le_8000_us\",\"frame_hist_le_10000_us\",\"frame_hist_le_12000_us\",\"frame_hist_le_16667_us\",\"frame_hist_le_20000_us\",\"frame_hist_le_25000_us\",\"frame_hist_le_30000_us\",\"frame_hist_le_33334_us\",\"frame_hist_le_40000_us\",\"frame_hist_le_50000_us\",\"frame_hist_le_66667_us\",\"frame_hist_le_83334_us\",\"frame_hist_le_100000_us\",\"frame_hist_le_150000_us\",\"frame_hist_le_200000_us\",\"frame_hist_le_300000_us\",\"frame_hist_le_500000_us\",\"frame_hist_le_1000000_us\",\"frame_hist_le_2000000_us\",\"frame_hist_over_2000000_us\",\"frame_max_us\",\"first_guest_frame_ticks\",\"last_guest_frame_ticks\",\"jit_started\",\"jit_inflight\",\"jit_max_ticks\",\"jit_slow_ge_16ms\",\"jit_last_slow_end_ticks\",\"jit_last_slow_duration_ticks\",\"fence_started\",\"fence_inflight\",\"fence_max_ticks\",\"fence_slow_ge_16ms\",\"fence_last_slow_end_ticks\",\"fence_last_slow_duration_ticks\",\"queue_submit_started\",\"queue_submit_inflight\",\"queue_submit_max_ticks\",\"queue_submit_slow_ge_16ms\",\"queue_submit_last_slow_end_ticks\",\"queue_submit_last_slow_duration_ticks\",\"pipeline_create_started\",\"pipeline_create_inflight\",\"pipeline_create_max_ticks\",\"pipeline_create_slow_ge_16ms\",\"pipeline_create_last_slow_end_ticks\",\"pipeline_create_last_slow_duration_ticks\",\"background_compile_started\",\"background_compile_inflight\",\"background_compile_max_ticks\",\"background_compile_slow_ge_16ms\",\"background_compile_last_slow_end_ticks\",\"background_compile_last_slow_duration_ticks\",\"allocation_started\",\"allocation_inflight\",\"allocation_max_ticks\",\"allocation_slow_ge_16ms\",\"allocation_last_slow_end_ticks\",\"allocation_last_slow_duration_ticks\",\"present_loop_started\",\"present_loop_inflight\",\"present_loop_max_ticks\",\"present_loop_slow_ge_16ms\",\"present_loop_last_slow_end_ticks\",\"present_loop_last_slow_duration_ticks\",\"pipeline_lock_started\",\"pipeline_lock_inflight\",\"pipeline_lock_max_ticks\",\"pipeline_lock_slow_ge_16ms\",\"pipeline_lock_last_slow_end_ticks\",\"pipeline_lock_last_slow_duration_ticks\",\"pipeline_lock_completed\",\"pipeline_lock_ticks\",\"present_loop_completed\",\"present_loop_ticks\",\"pipeline_error_count\",\"background_compile_error_count\",\"log_warning_count\",\"log_error_count\",\"gc_managed_bytes\",\"gc_gen0\",\"gc_gen1\",\"gc_gen2\",\"temporary_pool_retained_bytes\",\"sample_stopwatch_ticks\",\"thermal_state\",\"compile_queue_pending\",\"native_half_supported\",\"first_host_present_ticks\",\"last_pipeline_error_vk_result\",\"no_suitable_memory_type_count\"],\"absoluteIndices\":[29,30,31,32,33,34,35,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,100,101,102,104,105,107,108,110,111,113,114,116,117,119,120,122,123,125,126,128,129,131,132,134,135,137,138,140,141,143,144,146,147,149,150,159,160,161,162,163,164,165,166,167,168,169],\"frameHistogram\":\"disjoint upper bounds in microseconds; last bin overflow\",\"slowThresholdMs\":16,\"sampleTargetMs\":250,\"maxSamples\":2401,\"stopwatchFrequency\":%" PRId64 "}\n", a19_probe_frequency());
++    fprintf(trace_file, "{\"type\":\"header\",\"schemaVersion\":6,\"build\":\"A19Core Modular 1.3\",\"counterNames\":[\"frames\",\"frame_interval_us\",\"frame_le_8_334ms\",\"frame_8_334_to_16_667ms\",\"frame_16_667_to_33_334ms\",\"frame_33_334_to_50ms\",\"frame_50_to_100ms\",\"frame_gt_100ms\",\"jit_compiles\",\"jit_compile_ticks\",\"jit_host_code_bytes\",\"jit_guest_code_bytes\",\"jit_shared_copy_bytes\",\"jit_local_copy_bytes\",\"jit_local_page_bytes\",\"jit_pad_calls\",\"jit_pad_ticks\",\"jit_local_icache_calls\",\"jit_local_icache_ticks\",\"fence_wait_calls\",\"fence_wait_ticks\",\"queue_submit_calls\",\"queue_submit_ticks\",\"pipeline_create_calls\",\"pipeline_create_ticks\",\"mapped_upload_bytes\",\"mirror_upload_bytes\",\"background_compile_jobs\",\"background_compile_ticks\",\"mvk_get_result\",\"mvk_set_result\",\"mvk_readback_result\",\"mvk_argument_buffers_readback\",\"mvk_command_limit_readback\",\"mvk_config_struct_bytes\",\"shader_workers\",\"fifo_intervals\",\"fifo_active_us\",\"host_present_calls\",\"host_present_ticks\",\"allocation_requests\",\"allocation_requested_bytes\",\"allocation_request_ticks\",\"staging_or_inline_fallback_requested_bytes\",\"mvk_statistics_result\",\"mvk_spirv_to_msl_count\",\"mvk_spirv_to_msl_avg_us\",\"mvk_msl_compile_count\",\"mvk_msl_compile_avg_us\",\"mvk_shader_cache_count\",\"mvk_shader_cache_avg_us\",\"mvk_pipeline_compile_count\",\"mvk_pipeline_compile_avg_us\",\"mvk_retrieve_command_count\",\"mvk_retrieve_command_avg_us\",\"mvk_encode_command_count\",\"mvk_encode_command_avg_us\",\"mvk_execute_command_count\",\"mvk_execute_command_avg_us\",\"mvk_gpu_memory_count\",\"mvk_gpu_memory_avg_kib_x1000\",\"jit_masked_index_fusions\",\"native_fp16_guest_ops\",\"tile_clear_passes\",\"retained_block_reuses\",\"retained_block_reuse_bytes\",\"qos_set_failures\",\"a19_buffer_lookup_hits\",\"a19_buffer_growth_rejected\",\"a19_uniform_reuses\",\"a19_shader_save_requeues\",\"a19_no_spin_renderer_instances\",\"a19_syncpoint_fast_hits\",\"a19_scheduler_rotations\",\"a19_temporary_pool_hits\",\"a19_texture_evictions\",\"a19_shared_pipeline_calls\",\"a19_thermal_delays\",\"a19_gpfifo_replays\",\"frame_hist_le_4000_us\",\"frame_hist_le_8000_us\",\"frame_hist_le_10000_us\",\"frame_hist_le_12000_us\",\"frame_hist_le_16667_us\",\"frame_hist_le_20000_us\",\"frame_hist_le_25000_us\",\"frame_hist_le_30000_us\",\"frame_hist_le_33334_us\",\"frame_hist_le_40000_us\",\"frame_hist_le_50000_us\",\"frame_hist_le_66667_us\",\"frame_hist_le_83334_us\",\"frame_hist_le_100000_us\",\"frame_hist_le_150000_us\",\"frame_hist_le_200000_us\",\"frame_hist_le_300000_us\",\"frame_hist_le_500000_us\",\"frame_hist_le_1000000_us\",\"frame_hist_le_2000000_us\",\"frame_hist_over_2000000_us\",\"frame_max_us\",\"first_guest_frame_ticks\",\"last_guest_frame_ticks\",\"jit_started\",\"jit_inflight\",\"jit_max_ticks\",\"jit_slow_ge_16ms\",\"jit_last_slow_end_ticks\",\"jit_last_slow_duration_ticks\",\"fence_started\",\"fence_inflight\",\"fence_max_ticks\",\"fence_slow_ge_16ms\",\"fence_last_slow_end_ticks\",\"fence_last_slow_duration_ticks\",\"queue_submit_started\",\"queue_submit_inflight\",\"queue_submit_max_ticks\",\"queue_submit_slow_ge_16ms\",\"queue_submit_last_slow_end_ticks\",\"queue_submit_last_slow_duration_ticks\",\"pipeline_create_started\",\"pipeline_create_inflight\",\"pipeline_create_max_ticks\",\"pipeline_create_slow_ge_16ms\",\"pipeline_create_last_slow_end_ticks\",\"pipeline_create_last_slow_duration_ticks\",\"background_compile_started\",\"background_compile_inflight\",\"background_compile_max_ticks\",\"background_compile_slow_ge_16ms\",\"background_compile_last_slow_end_ticks\",\"background_compile_last_slow_duration_ticks\",\"allocation_started\",\"allocation_inflight\",\"allocation_max_ticks\",\"allocation_slow_ge_16ms\",\"allocation_last_slow_end_ticks\",\"allocation_last_slow_duration_ticks\",\"present_loop_started\",\"present_loop_inflight\",\"present_loop_max_ticks\",\"present_loop_slow_ge_16ms\",\"present_loop_last_slow_end_ticks\",\"present_loop_last_slow_duration_ticks\",\"pipeline_lock_started\",\"pipeline_lock_inflight\",\"pipeline_lock_max_ticks\",\"pipeline_lock_slow_ge_16ms\",\"pipeline_lock_last_slow_end_ticks\",\"pipeline_lock_last_slow_duration_ticks\",\"pipeline_lock_completed\",\"pipeline_lock_ticks\",\"present_loop_completed\",\"present_loop_ticks\",\"pipeline_error_count\",\"background_compile_error_count\",\"log_warning_count\",\"log_error_count\",\"gc_managed_bytes\",\"gc_gen0\",\"gc_gen1\",\"gc_gen2\",\"temporary_pool_retained_bytes\",\"sample_stopwatch_ticks\",\"thermal_state\",\"compile_queue_pending\",\"native_half_supported\",\"first_host_present_ticks\",\"last_pipeline_error_vk_result\",\"no_suitable_memory_type_count\",\"a19_attachment_flush_deferred\",\"a19_attachment_flush_triggered\",\"a19_gpfifo_admissions\",\"a19_gpfifo_evictions\"],\"absoluteIndices\":[29,30,31,32,33,34,35,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,100,101,102,104,105,107,108,110,111,113,114,116,117,119,120,122,123,125,126,128,129,131,132,134,135,137,138,140,141,143,144,146,147,149,150,159,160,161,162,163,164,165,166,167,168,169],\"frameHistogram\":\"disjoint upper bounds in microseconds; last bin overflow\",\"slowThresholdMs\":16,\"sampleTargetMs\":250,\"maxSamples\":2401,\"stopwatchFrequency\":%" PRId64 "}\n", a19_probe_frequency());
+     // Swift JSONEncoder produces a single valid JSON object with escaped strings.
+     fprintf(trace_file, "{\"type\":\"context\",\"data\":%s}\n", metadata_json ? metadata_json : "{}");
+     if (!trace_flush(trace_file)) { fclose(trace_file); return 0; }
+diff --git a/src/MeloNX/MeloNX/Common/A19Lab.swift b/src/MeloNX/MeloNX/Common/A19Lab.swift
+--- a/src/MeloNX/MeloNX/Common/A19Lab.swift
++++ b/src/MeloNX/MeloNX/Common/A19Lab.swift
+@@ -19,7 +19,7 @@
+ @_silgen_name("a19_trace_count") private func a19TraceCount() -> Int32
+ @_silgen_name("a19_trace_error") private func a19TraceError() -> Int32
+ 
+-private let a19Names: [String] = ["frames", "frame_interval_us", "frame_le_8_334ms", "frame_8_334_to_16_667ms", "frame_16_667_to_33_334ms", "frame_33_334_to_50ms", "frame_50_to_100ms", "frame_gt_100ms", "jit_compiles", "jit_compile_ticks", "jit_host_code_bytes", "jit_guest_code_bytes", "jit_shared_copy_bytes", "jit_local_copy_bytes", "jit_local_page_bytes", "jit_pad_calls", "jit_pad_ticks", "jit_local_icache_calls", "jit_local_icache_ticks", "fence_wait_calls", "fence_wait_ticks", "queue_submit_calls", "queue_submit_ticks", "pipeline_create_calls", "pipeline_create_ticks", "mapped_upload_bytes", "mirror_upload_bytes", "background_compile_jobs", "background_compile_ticks", "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes", "mvk_statistics_result", "mvk_spirv_to_msl_count", "mvk_spirv_to_msl_avg_us", "mvk_msl_compile_count", "mvk_msl_compile_avg_us", "mvk_shader_cache_count", "mvk_shader_cache_avg_us", "mvk_pipeline_compile_count", "mvk_pipeline_compile_avg_us", "mvk_retrieve_command_count", "mvk_retrieve_command_avg_us", "mvk_encode_command_count", "mvk_encode_command_avg_us", "mvk_execute_command_count", "mvk_execute_command_avg_us", "mvk_gpu_memory_count", "mvk_gpu_memory_avg_kib_x1000", "jit_masked_index_fusions", "native_fp16_guest_ops", "tile_clear_passes", "retained_block_reuses", "retained_block_reuse_bytes", "qos_set_failures", "a19_buffer_lookup_hits", "a19_buffer_growth_rejected", "a19_uniform_reuses", "a19_shader_save_requeues", "a19_no_spin_renderer_instances", "a19_syncpoint_fast_hits", "a19_scheduler_rotations", "a19_temporary_pool_hits", "a19_texture_evictions", "a19_isolated_pipeline_calls", "a19_thermal_delays", "a19_gpfifo_replays", "frame_hist_le_4000_us", "frame_hist_le_8000_us", "frame_hist_le_10000_us", "frame_hist_le_12000_us", "frame_hist_le_16667_us", "frame_hist_le_20000_us", "frame_hist_le_25000_us", "frame_hist_le_30000_us", "frame_hist_le_33334_us", "frame_hist_le_40000_us", "frame_hist_le_50000_us", "frame_hist_le_66667_us", "frame_hist_le_83334_us", "frame_hist_le_100000_us", "frame_hist_le_150000_us", "frame_hist_le_200000_us", "frame_hist_le_300000_us", "frame_hist_le_500000_us", "frame_hist_le_1000000_us", "frame_hist_le_2000000_us", "frame_hist_over_2000000_us", "frame_max_us", "first_guest_frame_ticks", "last_guest_frame_ticks", "jit_started", "jit_inflight", "jit_max_ticks", "jit_slow_ge_16ms", "jit_last_slow_end_ticks", "jit_last_slow_duration_ticks", "fence_started", "fence_inflight", "fence_max_ticks", "fence_slow_ge_16ms", "fence_last_slow_end_ticks", "fence_last_slow_duration_ticks", "queue_submit_started", "queue_submit_inflight", "queue_submit_max_ticks", "queue_submit_slow_ge_16ms", "queue_submit_last_slow_end_ticks", "queue_submit_last_slow_duration_ticks", "pipeline_create_started", "pipeline_create_inflight", "pipeline_create_max_ticks", "pipeline_create_slow_ge_16ms", "pipeline_create_last_slow_end_ticks", "pipeline_create_last_slow_duration_ticks", "background_compile_started", "background_compile_inflight", "background_compile_max_ticks", "background_compile_slow_ge_16ms", "background_compile_last_slow_end_ticks", "background_compile_last_slow_duration_ticks", "allocation_started", "allocation_inflight", "allocation_max_ticks", "allocation_slow_ge_16ms", "allocation_last_slow_end_ticks", "allocation_last_slow_duration_ticks", "present_loop_started", "present_loop_inflight", "present_loop_max_ticks", "present_loop_slow_ge_16ms", "present_loop_last_slow_end_ticks", "present_loop_last_slow_duration_ticks", "pipeline_lock_started", "pipeline_lock_inflight", "pipeline_lock_max_ticks", "pipeline_lock_slow_ge_16ms", "pipeline_lock_last_slow_end_ticks", "pipeline_lock_last_slow_duration_ticks", "pipeline_lock_completed", "pipeline_lock_ticks", "present_loop_completed", "present_loop_ticks", "pipeline_error_count", "background_compile_error_count", "log_warning_count", "log_error_count", "gc_managed_bytes", "gc_gen0", "gc_gen1", "gc_gen2", "temporary_pool_retained_bytes", "sample_stopwatch_ticks", "thermal_state", "compile_queue_pending", "native_half_supported", "first_host_present_ticks", "last_pipeline_error_vk_result", "no_suitable_memory_type_count"]
++private let a19Names: [String] = ["frames", "frame_interval_us", "frame_le_8_334ms", "frame_8_334_to_16_667ms", "frame_16_667_to_33_334ms", "frame_33_334_to_50ms", "frame_50_to_100ms", "frame_gt_100ms", "jit_compiles", "jit_compile_ticks", "jit_host_code_bytes", "jit_guest_code_bytes", "jit_shared_copy_bytes", "jit_local_copy_bytes", "jit_local_page_bytes", "jit_pad_calls", "jit_pad_ticks", "jit_local_icache_calls", "jit_local_icache_ticks", "fence_wait_calls", "fence_wait_ticks", "queue_submit_calls", "queue_submit_ticks", "pipeline_create_calls", "pipeline_create_ticks", "mapped_upload_bytes", "mirror_upload_bytes", "background_compile_jobs", "background_compile_ticks", "mvk_get_result", "mvk_set_result", "mvk_readback_result", "mvk_argument_buffers_readback", "mvk_command_limit_readback", "mvk_config_struct_bytes", "shader_workers", "fifo_intervals", "fifo_active_us", "host_present_calls", "host_present_ticks", "allocation_requests", "allocation_requested_bytes", "allocation_request_ticks", "staging_or_inline_fallback_requested_bytes", "mvk_statistics_result", "mvk_spirv_to_msl_count", "mvk_spirv_to_msl_avg_us", "mvk_msl_compile_count", "mvk_msl_compile_avg_us", "mvk_shader_cache_count", "mvk_shader_cache_avg_us", "mvk_pipeline_compile_count", "mvk_pipeline_compile_avg_us", "mvk_retrieve_command_count", "mvk_retrieve_command_avg_us", "mvk_encode_command_count", "mvk_encode_command_avg_us", "mvk_execute_command_count", "mvk_execute_command_avg_us", "mvk_gpu_memory_count", "mvk_gpu_memory_avg_kib_x1000", "jit_masked_index_fusions", "native_fp16_guest_ops", "tile_clear_passes", "retained_block_reuses", "retained_block_reuse_bytes", "qos_set_failures", "a19_buffer_lookup_hits", "a19_buffer_growth_rejected", "a19_uniform_reuses", "a19_shader_save_requeues", "a19_no_spin_renderer_instances", "a19_syncpoint_fast_hits", "a19_scheduler_rotations", "a19_temporary_pool_hits", "a19_texture_evictions", "a19_shared_pipeline_calls", "a19_thermal_delays", "a19_gpfifo_replays", "frame_hist_le_4000_us", "frame_hist_le_8000_us", "frame_hist_le_10000_us", "frame_hist_le_12000_us", "frame_hist_le_16667_us", "frame_hist_le_20000_us", "frame_hist_le_25000_us", "frame_hist_le_30000_us", "frame_hist_le_33334_us", "frame_hist_le_40000_us", "frame_hist_le_50000_us", "frame_hist_le_66667_us", "frame_hist_le_83334_us", "frame_hist_le_100000_us", "frame_hist_le_150000_us", "frame_hist_le_200000_us", "frame_hist_le_300000_us", "frame_hist_le_500000_us", "frame_hist_le_1000000_us", "frame_hist_le_2000000_us", "frame_hist_over_2000000_us", "frame_max_us", "first_guest_frame_ticks", "last_guest_frame_ticks", "jit_started", "jit_inflight", "jit_max_ticks", "jit_slow_ge_16ms", "jit_last_slow_end_ticks", "jit_last_slow_duration_ticks", "fence_started", "fence_inflight", "fence_max_ticks", "fence_slow_ge_16ms", "fence_last_slow_end_ticks", "fence_last_slow_duration_ticks", "queue_submit_started", "queue_submit_inflight", "queue_submit_max_ticks", "queue_submit_slow_ge_16ms", "queue_submit_last_slow_end_ticks", "queue_submit_last_slow_duration_ticks", "pipeline_create_started", "pipeline_create_inflight", "pipeline_create_max_ticks", "pipeline_create_slow_ge_16ms", "pipeline_create_last_slow_end_ticks", "pipeline_create_last_slow_duration_ticks", "background_compile_started", "background_compile_inflight", "background_compile_max_ticks", "background_compile_slow_ge_16ms", "background_compile_last_slow_end_ticks", "background_compile_last_slow_duration_ticks", "allocation_started", "allocation_inflight", "allocation_max_ticks", "allocation_slow_ge_16ms", "allocation_last_slow_end_ticks", "allocation_last_slow_duration_ticks", "present_loop_started", "present_loop_inflight", "present_loop_max_ticks", "present_loop_slow_ge_16ms", "present_loop_last_slow_end_ticks", "present_loop_last_slow_duration_ticks", "pipeline_lock_started", "pipeline_lock_inflight", "pipeline_lock_max_ticks", "pipeline_lock_slow_ge_16ms", "pipeline_lock_last_slow_end_ticks", "pipeline_lock_last_slow_duration_ticks", "pipeline_lock_completed", "pipeline_lock_ticks", "present_loop_completed", "present_loop_ticks", "pipeline_error_count", "background_compile_error_count", "log_warning_count", "log_error_count", "gc_managed_bytes", "gc_gen0", "gc_gen1", "gc_gen2", "temporary_pool_retained_bytes", "sample_stopwatch_ticks", "thermal_state", "compile_queue_pending", "native_half_supported", "first_host_present_ticks", "last_pipeline_error_vk_result", "no_suitable_memory_type_count", "a19_attachment_flush_deferred", "a19_attachment_flush_triggered", "a19_gpfifo_admissions", "a19_gpfifo_evictions"]
+ 
+ private struct A19Report: Codable {
+     let schemaVersion: Int
+@@ -101,7 +101,7 @@
+     var valid: Bool {
+         [0, 1, 2].contains(argumentBuffers) && [0, 32, 64, 128].contains(commandLimit) &&
+         [0, 1, 2].contains(shaderWorkers) && [0, 4, 8, 16].contains(jitPadCalls) &&
+-        (0...131071).contains(experimentMask)
++        (0...262143).contains(experimentMask)
+     }
+     var values: [Int32] {
+         [argumentBuffers, commandLimit, shaderWorkers, jitPadCalls, experimentMask].map { Int32($0) }
+@@ -145,6 +145,7 @@
+     @Published var isolatedPipelines = false
+     @Published var thermalCompile = false
+     @Published var commandReuse = false
++    @Published var attachmentBatch = false
+     @Published private(set) var gameActive = false
+     @Published private(set) var applyStatus = "Referencia: todas las opciones desactivadas."
+     @Published private var savedSelection = A19LabSelection.reference
+@@ -173,6 +174,7 @@
+         if isolatedPipelines { mask |= 16384 }
+         if thermalCompile { mask |= 32768 }
+         if commandReuse { mask |= 65536 }
++        if attachmentBatch { mask |= 131072 }
+         return mask
+     }
+     private var selection: A19LabSelection {
+@@ -201,6 +203,7 @@
+         isolatedPipelines = (value.experimentMask & 16384) != 0
+         thermalCompile = (value.experimentMask & 32768) != 0
+         commandReuse = (value.experimentMask & 65536) != 0
++        attachmentBatch = (value.experimentMask & 131072) != 0
+     }
+     func resetOptions() {
+         restoreSelection(.reference)
+@@ -400,7 +403,7 @@
+         writeReport()
+     }
+     private func writeReport() {
+-        let report = A19Report(schemaVersion: 5, build: "A19Core Modular 1.2", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, note: "Schema 5: use absoluteIndices in native JSONL header. JSONL is self-contained; this summary is optional. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes negative or zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, game content, pairing or file paths included. Game title ID and version are included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
++        let report = A19Report(schemaVersion: 6, build: "A19Core Modular 1.3", hardware: hardware, settings: selected, gameSettings: gameSettings, gameStartSeconds: gameStartSeconds, gameEndSeconds: gameEndSeconds, gameExitCode: gameExitCode, stopwatchFrequency: a19Frequency(), benchmarkHardware: benchmarkHardware, benchmarks: benchmarks, note: "Schema 6: hot hit counters 67, 69 and 78 are lower bounds (batches of 256); use absoluteIndices in native JSONL header. JSONL is self-contained; this summary is optional. GPU memory tracker is average KiB multiplied by 1000, other MVK averages are microseconds. Frame intervals are guest presentation intervals, not display scanout. Concurrent worker ticks can exceed wall time. Allocation and fallback bytes are requests, not actual RAM traffic. MVK results are readback status; struct bytes negative or zero means not initialized. FIFO/fence/submit timings are CPU-side, not GPU utilization. No keys, game content, pairing or file paths included. Game title ID and version are included.", benchmarkNotes: ["latency":"Random dependent loads across 64-byte-spaced working sets; not a direct cache-size reading.","bandwidth":"Copy bytes per second, not DRAM bus bandwidth.","atomic":"Single-thread relaxed fetch_add.","metal":"Median GPU duration of synthetic f32/f16 kernels; not peak FLOPS or game FPS."])
+         do { let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]; try encoder.encode(report).write(to: destination, options: .atomic); reportURL = destination }
+         catch { status = "Report could not be saved." }
+     }
+@@ -435,9 +438,10 @@
+                 Toggle("Scheduler sin cierres temporales", isOn: $lab.schedulerAlloc)
+                 Toggle("Límite de buffers temporales", isOn: $lab.poolBudget)
+                 Toggle("Caché de texturas adaptativa", isOn: $lab.textureBudget)
+-                Toggle("Pipelines independientes (experimental)", isOn: $lab.isolatedPipelines)
++                Toggle("Pipelines concurrentes con caché compartida", isOn: $lab.isolatedPipelines)
+                 Toggle("Compilación sensible a temperatura", isOn: $lab.thermalCompile)
+                 Toggle("Reutilización GPFIFO adaptativa", isOn: $lab.commandReuse)
++                Toggle("Agrupar envíos de GPU (adaptativo)", isOn: $lab.attachmentBatch)
+                 Button("Aplicar al próximo juego") { lab.apply() }
+                     .buttonStyle(.borderless)
+                 Button("Restablecer referencia") { lab.resetOptions() }
+diff --git a/src/Ryujinx.Common/A19Probe.cs b/src/Ryujinx.Common/A19Probe.cs
+--- a/src/Ryujinx.Common/A19Probe.cs
++++ b/src/Ryujinx.Common/A19Probe.cs
+@@ -7,7 +7,7 @@
+     // Cumulative counters; snapshots are deliberately non-blocking and approximate across threads.
+     public static class A19Probe
+     {
+-        public const int Count = 171;
++        public const int Count = 175;
+         // A19 reports 128-byte cache lines. 256-byte stride also prevents adjacent counters sharing a line.
+         private const int Stride = 32;
+         private static readonly long[] Values = new long[Count * Stride];
+@@ -20,7 +20,7 @@
+         {
+             if (!OperatingSystem.IsIOS() || arg is not (0 or 1 or 2) ||
+                 limit is not (0 or 32 or 64 or 128) || workers is not (0 or 1 or 2) ||
+-                padCalls is not (0 or 4 or 8 or 16) || mask < 0 || mask > 131071)
++                padCalls is not (0 or 4 or 8 or 16) || mask < 0 || mask > 262143)
+                 return false;
+             Options(arg, limit, workers, padCalls);
+             SetExperiments(mask);
+@@ -28,18 +28,44 @@
+                 JitPadCalls == padCalls && ExperimentMask == mask;
+         }
+         public static bool NativeHalf => Experiment(2) && Volatile.Read(ref _nativeHalfSupported) == 1;
+-        public static void SetExperiments(int mask) => Volatile.Write(ref _experiments, mask & 131071);
++        public static void SetExperiments(int mask) => Volatile.Write(ref _experiments, mask & 262143);
+         public static void SetNativeHalfSupported(bool supported) => Volatile.Write(ref _nativeHalfSupported, supported ? 1 : 0);
+         public static bool Enabled => Volatile.Read(ref _enabled) != 0;
+         public static int ArgumentBuffers => Volatile.Read(ref _argumentBuffers);
+         public static int CommandLimit => Volatile.Read(ref _commandLimit);
+         public static int ShaderWorkers => Volatile.Read(ref _shaderWorkers);
+         public static int JitPadCalls => Volatile.Read(ref _jitPadCalls);
++        private static int _captureEpoch;
++        [ThreadStatic] private static int _localEpoch, _pendingBuffer, _pendingUniform, _pendingFifo;
++        private const int HotBatch = 256;
++
++        public static void BufferLookupHit() => BatchHit(ref _pendingBuffer, 67);
++        public static void UniformReuseHit() => BatchHit(ref _pendingUniform, 69);
++        public static void CommandReuseHit() => BatchHit(ref _pendingFifo, 78);
++
++        private static void BatchHit(ref int pending, int index)
++        {
++            if (!Enabled) return;
++            int epoch = Volatile.Read(ref _captureEpoch);
++            if (_localEpoch != epoch)
++            {
++                _pendingBuffer = _pendingUniform = _pendingFifo = 0;
++                _localEpoch = epoch;
++            }
++            if (++pending == HotBatch)
++            {
++                pending = 0;
++                if (Enabled && epoch == Volatile.Read(ref _captureEpoch))
++                    Interlocked.Add(ref Values[index * Stride], HotBatch);
++            }
++        }
++
+         public static void Enable(int enabled)
+         {
+             // Capture starts only before game construction, after the previous engine exited.
+             if (enabled != 0 && !Enabled)
+             {
++                Interlocked.Increment(ref _captureEpoch);
+                 Array.Clear(Values);
+                 for (int i = 29; i <= 35; i++) Set(i, -1);
+                 Set(44, -104);
+diff --git a/src/Ryujinx.Common/A19Trial.cs b/src/Ryujinx.Common/A19Trial.cs
+--- a/src/Ryujinx.Common/A19Trial.cs
++++ b/src/Ryujinx.Common/A19Trial.cs
+@@ -20,6 +20,7 @@
+         public const int IsolatedPipelines = 16384;
+         public const int ThermalCompile = 32768;
+         public const int CommandReuse = 65536;
++        public const int AttachmentBatch = 131072;
+         private static int _thermal;
+         private static long _available = -1, _sampleTime;
+         private static long _pooledBytes;
+diff --git a/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoProcessor.cs b/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoProcessor.cs
+--- a/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoProcessor.cs
++++ b/src/Ryujinx.Graphics.Gpu/Engine/GPFifo/GPFifoProcessor.cs
+@@ -79,6 +79,8 @@
+         private const int S2ASegMinLen = 8, S2ASegCap = 128, S2ASegMaxWords = 512;
+         private int _a19Trials, _a19Hits, _a19Skip;
+         private Dictionary<ulong, S2ASeg> _s2aSegs;
++        // FIFO eviction keeps the existing bounded capacity without throwing away hot entries in bulk.
++        private Queue<ulong> _a19SegOrder;
+ 
+         // Admit a segment on its second observation.
+         private const int S2ASeenBits = 16;
+@@ -198,7 +200,8 @@
+             // Only immutable, privately prefetched words qualify. No snapshot or replay of live guest memory.
+             ReadOnlySpan<int> words = commandBuffer;
+             _s2aSeen ??= new ulong[1 << S2ASeenBits];
+-            _s2aSegs ??= new();
++            _s2aSegs ??= new(S2ASegCap);
++            _a19SegOrder ??= new(S2ASegCap);
+             _s2aRecBuf ??= new();
+             if (++_a19Trials >= 256)
+             {
+@@ -211,7 +214,7 @@
+             if (_s2aSegs.TryGetValue(key, out S2ASeg seg) && seg.Len == words.Length && S2AStateEq(seg.Start, start) && words.SequenceEqual(seg.Words))
+             {
+                 _a19Hits++;
+-                A19Probe.Add(78);
++                A19Probe.CommandReuseHit();
+                 S2AReplay(baseGpuVa, words, seg);
+                 return;
+             }
+@@ -236,11 +239,16 @@
+                 _s2aRec = null;
+             }
+ 
+-            if (_s2aSegs.Count >= S2ASegCap)
+-            {
+-                _s2aSegs.Clear();
+-            }
+-
++            if (!_s2aSegs.ContainsKey(key))
++            {
++                if (_s2aSegs.Count >= S2ASegCap)
++                {
++                    _s2aSegs.Remove(_a19SegOrder.Dequeue());
++                    A19Probe.Add(174);
++                }
++                _a19SegOrder.Enqueue(key);
++            }
++            A19Probe.Add(173);
+             _s2aSegs[key] = new S2ASeg { Len = words.Length, Words = words.ToArray(), Start = start, End = _state, Ops = _s2aRecBuf.ToArray() };
+         }
+ 
+diff --git a/src/Ryujinx.Graphics.Gpu/Memory/BufferCache.cs b/src/Ryujinx.Graphics.Gpu/Memory/BufferCache.cs
+--- a/src/Ryujinx.Graphics.Gpu/Memory/BufferCache.cs
++++ b/src/Ryujinx.Graphics.Gpu/Memory/BufferCache.cs
+@@ -53,7 +53,7 @@
+             Buffer hit = _a19Recent[index];
+             if (hit != null && address >= hit.Address && address <= hit.EndAddress && size <= hit.EndAddress - address)
+             {
+-                A19Probe.Add(67);
++                A19Probe.BufferLookupHit();
+                 return hit;
+             }
+             Buffer found = _buffers.FindOverlap(address, size);
+diff --git a/src/Ryujinx.Graphics.Gpu/Memory/BufferManager.cs b/src/Ryujinx.Graphics.Gpu/Memory/BufferManager.cs
+--- a/src/Ryujinx.Graphics.Gpu/Memory/BufferManager.cs
++++ b/src/Ryujinx.Graphics.Gpu/Memory/BufferManager.cs
+@@ -323,7 +323,7 @@
+             if (A19Probe.Experiment(A19Trial.UniformReuse) &&
+                 _gpUniformBuffers[stage].Buffers[index].Equals(new BufferBounds(range)))
+             {
+-                A19Probe.Add(69);
++                A19Probe.UniformReuseHit();
+                 return;
+             }
+             _gpUniformBuffers[stage].SetBounds(index, range);
+diff --git a/src/Ryujinx.Graphics.Vulkan/AutoFlushCounter.cs b/src/Ryujinx.Graphics.Vulkan/AutoFlushCounter.cs
+--- a/src/Ryujinx.Graphics.Vulkan/AutoFlushCounter.cs
++++ b/src/Ryujinx.Graphics.Vulkan/AutoFlushCounter.cs
+@@ -1,3 +1,4 @@
++using Ryujinx.Common;
+ using Ryujinx.Common.Logging;
+ using System;
+ using System.Diagnostics;
+@@ -27,6 +28,8 @@
+         private const int InitialQueryCountForFlush = 32;
+ 
+         private readonly VulkanRenderer _gd;
++        private readonly bool _a19BatchAttachments = A19Probe.Experiment(A19Trial.AttachmentBatch);
++        private const long A19MinAvailable = 768L * 1024 * 1024;
+ 
+         private long _lastFlush;
+         private ulong _lastDrawCount;
+@@ -127,6 +130,7 @@
+             // Flush when there's an attachment change out of a large block of queries.
+             if (_consecutiveQueries > MinConsecutiveQueryForFlush)
+             {
++                A19Probe.Add(172);
+                 return true;
+             }
+ 
+@@ -144,11 +148,20 @@
+                 return false;
+             }
+ 
+-            long flushTimeout = _framebufferFlushTimer;
++            long now = Stopwatch.GetTimestamp();
++            long elapsed = now - _lastFlush;
++            if (elapsed <= _framebufferFlushTimer) return false;
+ 
+-            long now = Stopwatch.GetTimestamp();
+-
+-            return now > _lastFlush + flushTimeout;
++            // Only defer a discretionary submit for up to one additional millisecond.
++            // Query-driven, sync-driven, presentation and memory-weight flushes remain unchanged.
++            if (_a19BatchAttachments && !_fastFlushMode && !_hasPendingQuery &&
++                elapsed <= 2 * _framebufferFlushTimer && A19Trial.AvailableBytes >= A19MinAvailable)
++            {
++                A19Probe.Add(171);
++                return false;
++            }
++            A19Probe.Add(172);
++            return true;
+         }
+ 
+         public void Present()
+diff --git a/src/Ryujinx.Graphics.Vulkan/PipelineState.cs b/src/Ryujinx.Graphics.Vulkan/PipelineState.cs
+--- a/src/Ryujinx.Graphics.Vulkan/PipelineState.cs
++++ b/src/Ryujinx.Graphics.Vulkan/PipelineState.cs
+@@ -397,7 +397,7 @@
+                 if (A19Probe.Experiment(A19Trial.IsolatedPipelines))
+                 {
+                     long pipelineStart = A19Probe.Begin(23);
+-                    try { result = gd.Api.CreateComputePipelines(device, default, 1, &pipelineCreateInfo, null, &pipelineHandle); }
++                    try { result = gd.Api.CreateComputePipelines(device, cache, 1, &pipelineCreateInfo, null, &pipelineHandle); }
+                     finally { A19Probe.Finish(pipelineStart, 23, 24); }
+                     A19Probe.Add(76);
+                 }
+@@ -712,7 +712,7 @@
+                 if (A19Probe.Experiment(A19Trial.IsolatedPipelines))
+                 {
+                     long pipelineStart = A19Probe.Begin(23);
+-                    try { result = gd.Api.CreateGraphicsPipelines(device, default, 1, &pipelineCreateInfo, null, &pipelineHandle); }
++                    try { result = gd.Api.CreateGraphicsPipelines(device, cache, 1, &pipelineCreateInfo, null, &pipelineHandle); }
+                     finally { A19Probe.Finish(pipelineStart, 23, 24); }
+                     A19Probe.Add(76);
+                 }

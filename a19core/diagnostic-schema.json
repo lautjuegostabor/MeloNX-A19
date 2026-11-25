@@ -76,7 +76,7 @@
     "a19_scheduler_rotations",
     "a19_temporary_pool_hits",
     "a19_texture_evictions",
-    "a19_isolated_pipeline_calls",
+    "a19_shared_pipeline_calls",
     "a19_thermal_delays",
     "a19_gpfifo_replays",
     "frame_hist_le_4000_us",
@@ -170,7 +170,11 @@
     "native_half_supported",
     "first_host_present_ticks",
     "last_pipeline_error_vk_result",
-    "no_suitable_memory_type_count"
+    "no_suitable_memory_type_count",
+    "a19_attachment_flush_deferred",
+    "a19_attachment_flush_triggered",
+    "a19_gpfifo_admissions",
+    "a19_gpfifo_evictions"
   ],
   "absoluteIndices": [
     29,
@@ -321,7 +325,7 @@
     "a19_scheduler_rotations": 73,
     "a19_temporary_pool_hits": 74,
     "a19_texture_evictions": 75,
-    "a19_isolated_pipeline_calls": 76,
+    "a19_shared_pipeline_calls": 76,
     "a19_thermal_delays": 77,
     "a19_gpfifo_replays": 78,
     "frame_hist_le_4000_us": 79,
@@ -415,6 +419,12 @@
     "native_half_supported": 167,
     "first_host_present_ticks": 168,
     "last_pipeline_error_vk_result": 169,
-    "no_suitable_memory_type_count": 170
-  }
+    "no_suitable_memory_type_count": 170,
+    "a19_attachment_flush_deferred": 171,
+    "a19_attachment_flush_triggered": 172,
+    "a19_gpfifo_admissions": 173,
+    "a19_gpfifo_evictions": 174
+  },
+  "schemaVersion": 6,
+  "hotCountersBatchSize": 256
 }

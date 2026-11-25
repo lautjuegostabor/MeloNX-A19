@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read schema-5 A19Core JSONL; incomplete last line is tolerated, never infer GPU utilization."""
+"""Read schema-5/6 A19Core JSONL; incomplete last line is tolerated, never infer GPU utilization."""
 import json, sys, math
 from pathlib import Path
 
@@ -10,7 +10,7 @@ def analyze(path):
         except (ValueError,UnicodeError):
             if i!=len(lines)-1: raise
             partial=True
-    h=next(x for x in rows if x.get('type')=='header'); assert h['schemaVersion']==5
+    h=next(x for x in rows if x.get('type')=='header'); assert h['schemaVersion'] in (5,6)
     names=h['counterNames']; freq=h['stopwatchFrequency']; assert freq>0 and len(names)==len(set(names))
     ctx=next((x['data'] for x in rows if x.get('type')=='context'),{})
     samples=[x for x in rows if x.get('type')=='sample']; foot=next((x for x in rows if x.get('type')=='footer'),None)
@@ -37,7 +37,7 @@ def analyze(path):
             windows.append({'endSeconds':b['elapsedSeconds'],'intervalSeconds':dt,'guestIntervals':frames,'over100ms':slow,'secondsSinceLastGuestFrame':since_last,'availableMiB':b['availableProcessBytes']/1048576,'thermal':b['thermalState'],'inflight':{n:bv[n+'_inflight'] for n in stages},'slowCompletions':{n:bv[n+'_slow_ge_16ms']-av[n+'_slow_ge_16ms'] for n in stages}})
     windows.sort(key=lambda w:(w['secondsSinceLastGuestFrame'] or 0,w['over100ms']),reverse=True)
     avail=[s['availableProcessBytes'] for s in samples]; footprint=[s['footprintBytes'] for s in samples if s['footprintBytes']>0]
-    return {'context':ctx,'samples':len(samples),'durationSeconds':stamps[-1],'footer':foot,'partialLastLine':partial,'guestFramesWithIntervals':end['frames'],'guestFpsFromIntervals':end['frames']*1e6/end['frame_interval_us'] if end['frame_interval_us'] else None,'framePercentileBinsMs':{str(q):percentile(q) for q in (.5,.95,.99)},'maxGuestIntervalMs':end['frame_max_us']/1000,'peakFootprintMiB':max(footprint)/1048576 if footprint else None,'minAvailableMiB':min(avail)/1048576,'gcCollectionDeltas':{n:end[n]-first[n] for n in ('gc_gen0','gc_gen1','gc_gen2')},'stages':{n:{'started':end[n+'_started'],'inflightAtLastSample':end[n+'_inflight'],'maxMs':end[n+'_max_ticks']*1000/freq,'slowCompleted':end[n+'_slow_ge_16ms']} for n in stages},'mvkReadback':{n:end[n] for n in names[29:36]},'optionActivity':{n:end[n] for n in names[61:79]},'largestStallWindows':windows[:20], 'notes':['Counters are approximate across threads. Concurrent durations overlap; no causal proof.','Percentiles are histogram intervals, not exact per-frame values. Missing footer may indicate abrupt process exit, not necessarily a crash.','Thermal state is last sampled by UI. Zero footprint means unavailable.']}
+    return {'context':ctx,'samples':len(samples),'durationSeconds':stamps[-1],'footer':foot,'partialLastLine':partial,'guestFramesWithIntervals':end['frames'],'guestFpsFromIntervals':end['frames']*1e6/end['frame_interval_us'] if end['frame_interval_us'] else None,'framePercentileBinsMs':{str(q):percentile(q) for q in (.5,.95,.99)},'maxGuestIntervalMs':end['frame_max_us']/1000,'peakFootprintMiB':max(footprint)/1048576 if footprint else None,'minAvailableMiB':min(avail)/1048576,'gcCollectionDeltas':{n:end[n]-first[n] for n in ('gc_gen0','gc_gen1','gc_gen2')},'stages':{n:{'started':end[n+'_started'],'inflightAtLastSample':end[n+'_inflight'],'maxMs':end[n+'_max_ticks']*1000/freq,'slowCompleted':end[n+'_slow_ge_16ms']} for n in stages},'mvkReadback':{n:end[n] for n in names[29:36]},'optionActivity':{n:end[n] for n in names[61:79]+names[171:]},'hotCountersAreLowerBounds':h['schemaVersion']>=6,'largestStallWindows':windows[:20], 'notes':['Counters are approximate across threads. Concurrent durations overlap; no causal proof.','Percentiles are histogram intervals, not exact per-frame values. Missing footer may indicate abrupt process exit, not necessarily a crash.','Thermal state is last sampled by UI. Zero footprint means unavailable.']}
 
 if __name__=='__main__':
     print(json.dumps(analyze(sys.argv[1]),indent=2,ensure_ascii=False))

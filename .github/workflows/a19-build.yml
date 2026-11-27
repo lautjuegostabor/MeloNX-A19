@@ -148,6 +148,11 @@ jobs:
         with:
           path: source/src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
           key: ${{ steps.core-cache.outputs.cache-primary-key }}
+      - name: Audit link-map checker before archive
+        run: |
+          python3 ../a19core/signing/validate-linkmap.py --self-test
+          mkdir -p build
+          rm -f build/A19Core-host-linkmap.txt
       - name: Archive MeloNX
         run: |
           xcodebuild archive -project src/MeloNX/MeloNX.xcodeproj -scheme MeloNX \
@@ -160,9 +165,8 @@ jobs:
       - name: Verify signing integration and unchanged JIT extension in IPA
         run: |
           python3 ../a19core/signing/validate-ipa.py build/MeloNX-A19-unsigned.ipa
-          APP=build/MeloNX.xcarchive/Products/Applications/MeloNX.app
-          nm "$APP/MeloNX" > "$RUNNER_TEMP/a19-signing-symbols.txt"
-          for sym in clearsign_refresh clearsign_setup_auth clearsign_setup_code; do grep -q " _${sym}$" "$RUNNER_TEMP/a19-signing-symbols.txt"; done
+          test -s build/A19Core-host-linkmap.txt || { echo "Host linker map not generated"; exit 1; }
+          python3 ../a19core/signing/validate-linkmap.py build/A19Core-host-linkmap.txt
       - uses: actions/upload-artifact@v4
         with:
           name: A19Core-Modular-1.3-signing-unsigned

@@ -40,6 +40,7 @@ def config(m):
     block=m.group(0)
     if 'INFOPLIST_FILE = MeloNX/Info.plist;' not in block: return block
     count+=1
+    block=once(block,"INFOPLIST_FILE = MeloNX/Info.plist;","INFOPLIST_FILE = MeloNX/Info.plist;\n\t\t\t\tLD_GENERATE_MAP_FILE = YES;\n\t\t\t\tLD_MAP_FILE_PATH = \"$(SRCROOT)/../../build/A19Core-host-linkmap.txt\";")
     pat=r'(?m)^([ \t]*)OTHER_LDFLAGS\s*=\s*(\([^;]*\)|[^;]+);'
     hit=re.search(pat,block)
     extra=", ".join(flags)

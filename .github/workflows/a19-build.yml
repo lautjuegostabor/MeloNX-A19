@@ -167,6 +167,16 @@ jobs:
           python3 ../a19core/signing/validate-ipa.py build/MeloNX-A19-unsigned.ipa
           test -s build/A19Core-host-linkmap.txt || { echo "Host linker map not generated"; exit 1; }
           python3 ../a19core/signing/validate-linkmap.py build/A19Core-host-linkmap.txt
+      - name: Preserve diagnostic link map and unvalidated candidate if checks fail
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A19Core-signing-diagnostics-not-validated
+          path: |
+            source/build/A19Core-host-linkmap.txt
+            source/build/MeloNX-A19-unsigned.ipa
+          if-no-files-found: ignore
+          retention-days: 7
       - uses: actions/upload-artifact@v4
         with:
           name: A19Core-Modular-1.3-signing-unsigned

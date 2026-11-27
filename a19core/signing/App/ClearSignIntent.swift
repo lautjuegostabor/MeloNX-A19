@@ -2,7 +2,7 @@ import AppIntents
 import Foundation
 
 // Host-only: signing credentials and native engine are never linked into the JIT extension.
-@available(iOS 26.0, *)
+@available(iOS 27.0, *)
 struct A19SigningPreventiveIntent: AppIntent {
     static var title: LocalizedStringResource = "Comprobar renovación A19Core"
     static var description = IntentDescription("Comprueba la vigencia y renueva perfiles si corresponde. Requiere sesión y renovación preventiva activada.")

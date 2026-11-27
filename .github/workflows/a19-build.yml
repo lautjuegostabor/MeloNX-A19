@@ -1,7 +1,7 @@
-name: Build A19Core Modular 1.3 (unsigned)
+name: Build A19Core Modular 1.3 + signing (unsigned)
 on:
   push:
-    branches: [ a19core-modular-1.3 ]
+    branches: [ a19core-modular-1.3-signing ]
   workflow_dispatch:
 concurrency:
   group: a19-${{ github.ref }}
@@ -25,6 +25,12 @@ jobs:
         with:
           ref: f925129209afd55927a0201d82285b8fa4b7ba30
           path: source
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lautjuegostabor/Clearwidget
+          ref: 5cb0913f0c7b7608041d3eaf9cfde22f1ad58895
+          path: clearwidget-pinned
           persist-credentials: false
       - name: Verify and apply experimental overlay
         run: |
@@ -64,6 +70,13 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Integrate pinned signing host and run regression tests
+        run: |
+          python3 ../a19core/signing/apply-host.py "$PWD" "$PWD/../a19core/signing"
+          xcrun swiftc -swift-version 5 ../a19core/signing/App/SigningControls.swift ../a19core/signing/App/A19SigningPolicy.swift ../a19core/signing/Tests/SigningControlsTests.swift -o "$RUNNER_TEMP/a19-signing-tests"
+          "$RUNNER_TEMP/a19-signing-tests"
+          for f in src/MeloNX/MeloNX/Common/A19Signing/*.swift; do xcrun swiftc -frontend -parse "$f"; done
+          bash ../a19core/signing/build-native.sh "$PWD" "$PWD/../clearwidget-pinned" "$PWD/../a19core/signing"
       - name: Preflight reviewed sources and toolchain fingerprint
         id: preflight
         run: |
@@ -144,8 +157,14 @@ jobs:
             SWIFT_OPTIMIZATION_LEVEL=-Onone
       - name: Assemble and validate unsigned IPA
         run: distribution/ios/a19/package.sh
+      - name: Verify signing integration and unchanged JIT extension in IPA
+        run: |
+          python3 ../a19core/signing/validate-ipa.py build/MeloNX-A19-unsigned.ipa
+          APP=build/MeloNX.xcarchive/Products/Applications/MeloNX.app
+          nm "$APP/MeloNX" > "$RUNNER_TEMP/a19-signing-symbols.txt"
+          for sym in clearsign_refresh clearsign_setup_auth clearsign_setup_code; do grep -q " _${sym}$" "$RUNNER_TEMP/a19-signing-symbols.txt"; done
       - uses: actions/upload-artifact@v4
         with:
-          name: A19Core-Modular-1.3-unsigned
+          name: A19Core-Modular-1.3-signing-unsigned
           path: source/build/MeloNX-A19-unsigned.ipa
           if-no-files-found: error
